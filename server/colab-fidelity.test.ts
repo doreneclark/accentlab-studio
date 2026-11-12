@@ -28,6 +28,8 @@ wanted = {
     "_status",
     "_audio_duration",
     "_prepare_reference",
+    "_prepare_vocalization",
+    "_parse_expression_script",
     "_safe_wav_audio",
     "_collect_final_audio",
     "_convert_once",
@@ -63,7 +65,7 @@ namespace["gr"] = SimpleNamespace(
 namespace["DIFFUSION_STEPS"] = 50
 exec(compile(ast.Module(body=functions, type_ignores=[]), "backend-functions.py", "exec"), namespace, namespace)
 namespace["torch"] = SimpleNamespace(device=lambda value: value, float16="float16")
-namespace["PIPELINE_VERSION"] = "identity-anchored-v3-text-safe"
+namespace["PIPELINE_VERSION"] = "identity-anchored-v4-expressive-text-safe"
 namespace["DIFFUSION_STEPS"] = 50
 namespace["ACCENT_TO_SOURCE_SIMILARITY"] = 0.93
 namespace["BLENDED_PROMPT_SIMILARITY"] = 0.80
@@ -72,12 +74,15 @@ namespace["PRONUNCIATION_MAX_ATTEMPTS"] = 2
 namespace["RETRY_DIFFUSION_STEPS"] = 40
 namespace["RETRY_SIMILARITY"] = 0.65
 namespace["RETRY_REPETITION_PENALTY"] = 1.2
-namespace["FINAL_SOURCE_SIMILARITY"] = 0.95
 namespace["SAMPLE_RATE"] = 22050
 namespace["MAX_REFERENCE_DECODE_SECONDS"] = 30.0
 namespace["MAX_REFERENCE_SECONDS"] = 25.0
+namespace["MAX_VOCALIZATION_DECODE_SECONDS"] = 12.0
+namespace["MAX_VOCALIZATION_SECONDS"] = 8.0
+namespace["MAX_VOCALIZATION_CUES"] = 6
 namespace["REFERENCE_SILENCE_TOP_DB"] = 40.0
 namespace["NEAR_SILENT_PEAK"] = 1e-4
+namespace["EXPRESSION_CUE_PATTERN"] = re.compile(r"\[(mood:(?:neutral|playful|excited|sad|calm)|laugh|giggle|sob)\]", re.IGNORECASE)
 namespace["MAX_SCRIPT_CHARS"] = 1200
 namespace["CHUNK_TARGET_CHARS"] = 260
 namespace["CHUNK_GAP_SECONDS"] = 0.08
@@ -108,12 +113,13 @@ reference_wave = np.concatenate([
     np.ones(6, dtype=np.float32) * 0.3,
     np.zeros(4, dtype=np.float32),
 ])
+vocalization_wave = np.ones(22050 * 10, dtype=np.float32) * 0.2
 class Effects:
     @staticmethod
     def trim(wave, top_db, frame_length, hop_length):
         assert top_db == 40.0
         assert frame_length == 2048 and hop_length == 512
-        return wave[4:-4], None
+        return (wave[4:-4] if wave.size == reference_wave.size else wave[2:-2]), None
 class Librosa:
     effects = Effects()
     @staticmethod
@@ -121,8 +127,11 @@ class Librosa:
         return 1.0
     @staticmethod
     def load(path, sr, mono, duration):
-        assert sr == 22050 and mono is True and duration == 30.0
-        return reference_wave, sr
+        assert sr == 22050 and mono is True
+        if duration == 30.0:
+            return reference_wave, sr
+        assert duration == 12.0
+        return vocalization_wave, sr
 class SoundFile:
     @staticmethod
     def write(path, wave, sr, subtype):
@@ -137,6 +146,18 @@ namespace["_prepare_reference"]("reference.wav", Path("prepared.wav"), "Original
 assert len(prepared_writes) == 1
 assert prepared_writes[0].size == reference_wave.size - 8
 assert np.any(prepared_writes[0] == 0.0), "internal pause must not be trimmed"
+prepared_event = namespace["_prepare_vocalization"]("laugh.wav", "Laugh sample")
+assert prepared_event[0] == 22050
+assert prepared_event[1].size == int(8.0 * 22050), "event audio must be duration-capped"
+parsed = namespace["_parse_expression_script"](
+    "[mood:playful]That was funny. [giggle] [mood:sad]I miss you. [sob]"
+)
+assert parsed == [
+    {"kind": "speech", "text": "That was funny.", "mood": "playful"},
+    {"kind": "vocalization", "cue": "giggle"},
+    {"kind": "speech", "text": "I miss you.", "mood": "sad"},
+    {"kind": "vocalization", "cue": "sob"},
+]
 
 # Verify proportional output safety without upward normalization or hard clipping.
 safe = namespace["_safe_wav_audio"](np.array([0.5, 1.0, -2.0], dtype=np.float32))
@@ -170,7 +191,8 @@ namespace["GENERATION_LOCK"] = threading.Lock()
 namespace["_validate_audio"] = lambda path, label: path
 namespace["_cleanup_old_outputs"] = lambda: None
 namespace["_prepare_reference"] = lambda original, prepared, label: prepared.write_bytes(b"prepared")
-namespace["_make_neutral_speech"] = lambda text, output: Path(output).write_bytes(b"neutral")
+tts_moods = []
+namespace["_make_neutral_speech"] = lambda text, output, mood="neutral": (tts_moods.append((text, mood)), Path(output).write_bytes(b"neutral"))[1]
 written_paths = []
 def write_safe(path, audio, sample_rate):
     written_paths.append(Path(path).name)
@@ -197,10 +219,44 @@ assert all(call["temperature"] == 0.7 for call in model.calls)
 assert all(call["repetition_penalty"] == 1.5 for call in model.calls)
 assert model.calls[0]["source_audio_path"].endswith("accent_reference.wav")
 assert model.calls[0]["target_audio_path"].endswith("source_reference.wav")
-assert model.calls[1]["source_audio_path"].endswith("neutral_tts_0.wav")
+assert model.calls[1]["source_audio_path"].endswith("mood_scaffold_1.wav")
 assert model.calls[1]["target_audio_path"].endswith("accent_reference_in_source_voice.wav")
 assert progress_events[-1][0] == 1.0
 assert written_paths[-1].startswith("accentlab_")
+assert tts_moods[-1] == ("Exact script", "neutral")
+
+# Vocal events are inserted in order from the supplied clip and never enter ASR.
+event_model = Model()
+namespace["MODEL"] = event_model
+final_arrays = []
+def write_safe_with_capture(path, audio, sample_rate):
+    final_arrays.append(np.asarray(audio, dtype=np.float32).copy())
+    write_safe(path, audio, sample_rate)
+namespace["_write_safe_wav"] = write_safe_with_capture
+namespace["_verify_chunk"] = lambda path, expected: {"ok": True, "uncertain": False, "missing": [], "unexpected": [], "substitutions": []}
+event_result = namespace["_generate"](
+    "original-upload.wav", "accent-upload.wav",
+    "[mood:playful]First line. [laugh] [mood:sad]Second line.",
+    "valid", True, "laugh.wav", None,
+    progress=lambda *args, **kwargs: None,
+)
+assert event_result.endswith(".wav")
+assert len(event_model.calls) == 3, "one accent pass plus two speech segments; no event conversion"
+assert [item[1] for item in tts_moods[-2:]] == ["playful", "sad"]
+event_output = final_arrays[-1]
+event_indices = np.where(np.isclose(event_output, 0.2))[0]
+assert event_indices.size > 0
+assert 22050 < event_indices[0] < event_output.size - 22050
+
+try:
+    namespace["_generate"](
+        "original-upload.wav", "accent-upload.wav", "[sob]", "valid", True,
+        progress=lambda *args, **kwargs: None,
+    )
+except GrError as error:
+    assert "cry/sob sample" in str(error)
+else:
+    raise AssertionError("sob cue must require its original-speaker sample")
 
 # A definite word mismatch retries only the failed chunk with safer settings.
 retry_model = Model()
@@ -236,14 +292,14 @@ assert not any(name.startswith("accentlab_") for name in written_paths), "no fin
 # Authorized status carries the version; unauthorized status remains concealed.
 namespace["GPU_AVAILABLE"] = True
 namespace["MODEL"] = object()
-assert namespace["_status"]("valid")["pipeline_version"] == "identity-anchored-v3-text-safe"
+assert namespace["_status"]("valid")["pipeline_version"] == "identity-anchored-v4-expressive-text-safe"
 unauthorized = namespace["_status"]("wrong")
 assert "pipeline_version" not in unauthorized
 assert unauthorized.get("ready") is False
 assert unauthorized.get("gpu") is False
 assert unauthorized.get("sample_rate") == 22050
 assert unauthorized.get("message") == "Invalid access code."
-print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v3-text-safe"}))
+print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v4-expressive-text-safe"}))
 `;
 
 describe("identity-anchored backend fidelity", () => {

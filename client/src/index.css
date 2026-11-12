@@ -513,6 +513,85 @@ h1 em {
 .tip svg {
   color: var(--primary);
 }
+.expression-cue-toolbar {
+  display: grid;
+  gap: 13px;
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+}
+.cue-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.cue-group > .mini-label {
+  min-width: 85px;
+  padding-top: 7px;
+}
+.cue-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cue-button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f5f2ec;
+  color: var(--ink-soft);
+  padding: 5px 9px;
+  font-size: 10px;
+  line-height: 1.2;
+  transition:
+    border-color 0.18s,
+    color 0.18s,
+    background 0.18s;
+}
+.cue-button:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: rgba(239, 107, 93, 0.07);
+  color: #9c4138;
+}
+.cue-button:disabled {
+  opacity: 0.55;
+}
+.cue-button-event {
+  border-style: dashed;
+}
+.expression-sample-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+.sample-panel-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+.sample-panel-heading p,
+.expression-status {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.sample-panel-heading p {
+  text-align: right;
+}
+.expression-samples {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.expression-sample-card {
+  min-height: 133px;
+}
+.expression-sample-card.has-file {
+  min-height: 133px;
+}
+.expression-status.is-error {
+  color: #a54439;
+}
 .char-count {
   color: var(--muted-foreground);
   font-family: var(--mono);

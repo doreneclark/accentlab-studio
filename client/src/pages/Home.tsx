@@ -29,8 +29,9 @@ import {
   progressHttpDiagnostic,
   readProgressResponse,
 } from "@/lib/colab-progress";
+import { analyzeExpressionScript } from "@/lib/expression-cues";
 
-type RecordingKind = "source" | "accent";
+type RecordingKind = "source" | "accent" | "laugh" | "sob";
 type GenerationState = "idle" | "generating" | "complete" | "error";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type ManagedStage = "idle" | "installing" | "loading" | "ready" | "error";
@@ -89,6 +90,21 @@ function UploadCard({
   const inputRef = useRef<HTMLInputElement>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const isSource = kind === "source";
+  const isAccent = kind === "accent";
+  const label = isSource
+    ? "Voice identity"
+    : isAccent
+      ? "Accent reference"
+      : kind === "laugh"
+        ? "Laugh / giggle sample"
+        : "Cry / sob sample";
+  const uploadTitle = isSource
+    ? "Original speaker"
+    : isAccent
+      ? "Target accent"
+      : kind === "laugh"
+        ? "Original speaker’s laugh"
+        : "Original speaker’s sob";
   useEffect(() => {
     if (!file) {
       setPreviewUrl("");
@@ -99,11 +115,11 @@ function UploadCard({
     return () => URL.revokeObjectURL(url);
   }, [file]);
   return (
-    <div className={`reference-card compact-card ${file ? "has-file" : ""}`}>
+    <div
+      className={`reference-card compact-card ${kind === "laugh" || kind === "sob" ? "expression-sample-card" : ""} ${file ? "has-file" : ""}`}
+    >
       <div className="reference-topline">
-        <span className="mini-label">
-          {isSource ? "Voice identity" : "Accent reference"}
-        </span>
+        <span className="mini-label">{label}</span>
         <span className="status-badge">
           <span className="status-dot" />
           {file ? "Loaded" : "Waiting"}
@@ -119,11 +135,11 @@ function UploadCard({
           <span className="upload-icon">
             <UploadCloud size={19} />
           </span>
-          <span className="upload-title">
-            {isSource ? "Original speaker" : "Target accent"}
-          </span>
+          <span className="upload-title">{uploadTitle}</span>
           <span className="upload-subtitle">
-            Clean 5–30 sec excerpt · up to 20 MB
+            {kind === "source" || kind === "accent"
+              ? "Clean 5–30 sec excerpt · up to 20 MB"
+              : "Clean 1–8 sec sound · up to 20 MB"}
           </span>
         </button>
       ) : (
@@ -136,7 +152,11 @@ function UploadCard({
               <strong>{file.name}</strong>
               <small>
                 {formatBytes(file.size)} ·{" "}
-                {isSource ? "identity source" : "accent guide"}
+                {isSource
+                  ? "identity source"
+                  : isAccent
+                    ? "accent guide"
+                    : "event sample"}
               </small>
             </span>
             <button
@@ -144,7 +164,7 @@ function UploadCard({
               type="button"
               disabled={disabled}
               onClick={onClear}
-              aria-label={`Remove ${kind} recording`}
+              aria-label={`Remove ${label.toLowerCase()}`}
             >
               <X size={15} />
             </button>
@@ -156,7 +176,7 @@ function UploadCard({
               controls
               preload="metadata"
               src={previewUrl}
-              aria-label={`Preview ${kind} recording`}
+              aria-label={`Preview ${label.toLowerCase()}`}
             />
           )}
         </div>
@@ -167,7 +187,7 @@ function UploadCard({
         type="file"
         accept={AUDIO_ACCEPT}
         disabled={disabled}
-        aria-label={`Upload ${kind} recording`}
+        aria-label={`Upload ${label.toLowerCase()}`}
         onChange={event => {
           onSelect(event.target.files?.[0]);
           event.target.value = "";
@@ -180,6 +200,8 @@ function UploadCard({
 export default function Home() {
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [accentFile, setAccentFile] = useState<File | null>(null);
+  const [laughSample, setLaughSample] = useState<File | null>(null);
+  const [sobSample, setSobSample] = useState<File | null>(null);
   const [script, setScript] = useState("");
   const [endpoint, setEndpoint] = useState("");
   const [accessKey, setAccessKey] = useState("");
@@ -205,6 +227,7 @@ export default function Home() {
   const [outputUrl, setOutputUrl] = useState("");
   const connectionRef = useRef<ColabConnection | null>(null);
   const generationAbort = useRef<AbortController | null>(null);
+  const scriptInput = useRef<HTMLTextAreaElement | null>(null);
   const connectionAttempt = useRef(0);
   const managedPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const managedPollInFlight = useRef(false);
@@ -214,20 +237,26 @@ export default function Home() {
   const mountedRef = useRef(true);
   const busy = generationState === "generating";
   const hasScript = Boolean(script.trim());
+  const expression = useMemo(
+    () => analyzeExpressionScript(script, Boolean(laughSample), Boolean(sobSample)),
+    [script, laughSample, sobSample]
+  );
   const canGenerate = Boolean(
     sourceFile &&
       accentFile &&
-      hasScript &&
+      (expression.hasSpeech || expression.hasVocalization) &&
+      expression.missingSamples.length === 0 &&
+      !expression.tooManyVocalizations &&
       consent &&
       connectionState === "connected" &&
       !busy
   );
   const estimatedSeconds = useMemo(
     () =>
-      script.trim()
-        ? `${Math.max(2, Math.round(script.trim().split(/\s+/).length / 2.35))} sec`
+      expression.spokenText.trim()
+        ? `${Math.max(2, Math.round(expression.spokenText.trim().split(/\s+/).length / 2.35))} sec`
         : "—",
-    [script]
+    [expression.spokenText]
   );
 
   const clearManagedPolling = () => {
@@ -343,12 +372,40 @@ export default function Home() {
     try {
       validateAudio(file);
       if (kind === "source") setSourceFile(file);
-      else setAccentFile(file);
+      else if (kind === "accent") setAccentFile(file);
+      else if (kind === "laugh") setLaughSample(file);
+      else setSobSample(file);
       resetOutput();
     } catch (failure) {
       setError(safeError(failure));
       setGenerationState("error");
     }
+  };
+
+  const insertExpressionCue = (cue: string) => {
+    if (busy) return;
+    const textarea = scriptInput.current;
+    const start = textarea?.selectionStart ?? script.length;
+    const end = textarea?.selectionEnd ?? start;
+    const before = script.slice(0, start);
+    const after = script.slice(end);
+    const prefix = before && !/\s$/.test(before) ? " " : "";
+    const suffix = after && !/^\s/.test(after) ? " " : "";
+    const insertion = `${prefix}${cue}${suffix}`;
+    const nextScript = `${before}${insertion}${after}`;
+    if (nextScript.length > MAX_SCRIPT_LENGTH) {
+      setError(`Cues and text share the ${MAX_SCRIPT_LENGTH}-character limit.`);
+      setGenerationState("error");
+      return;
+    }
+    setScript(nextScript);
+    resetOutput();
+    requestAnimationFrame(() => {
+      if (!textarea) return;
+      const position = before.length + insertion.length;
+      textarea.focus();
+      textarea.setSelectionRange(position, position);
+    });
   };
 
   const connectWithCredentials = async (
@@ -613,6 +670,8 @@ export default function Home() {
           accentReference: accentFile,
           script,
           consent,
+          laughSample: expression.needsLaughSample ? laughSample : null,
+          sobSample: expression.needsSobSample ? sobSample : null,
         },
         setProgress,
         controller.signal
@@ -663,9 +722,9 @@ export default function Home() {
               <em>Change the accent.</em>
             </h1>
             <p className="intro-copy">
-              Give AccentLab Studio the original speaker and a target-accent example.
-              Write a new message and try the experimental two-reference
-              conversion on your own free Colab GPU.
+              Write the exact line, mark where its delivery should shift, and
+              add the original speaker’s laugh or sob where needed. AccentLab
+              keeps the experimental two-reference conversion on your free T4.
             </p>
           </div>
           <div className="intro-note">
@@ -696,8 +755,8 @@ export default function Home() {
             button. For manual fallback, download the notebook, choose a{" "}
             <strong>T4 GPU</strong> in Colab, then run setup, restart once, and
             run the GPU check and final backend cell. Copy its URL and session
-            access code. Older notebooks must be replaced to use the
-            identity-anchored pipeline.
+            access code. Older notebooks must be replaced to use the expressive
+            text-safe pipeline.
           </p>
           <div className="colab-actions">
             <a
@@ -945,23 +1004,25 @@ export default function Home() {
               <p className="reference-tip">
                 Use one clear speaker per file, ideally 10–25 seconds of natural
                 speech without music. The updated notebook trims edge silence
-                and uses up to 25 seconds. The original speaker directly anchors
-                the final voice; the second recording guides the accent.
+                and uses up to 25 seconds. The original recording guides voice
+                identity and the second guides accent/style, but the model does
+                not perfectly separate those qualities.
               </p>
             </div>
           </aside>
 
           <section className="script-column">
             <div className="section-label">
-              <span>02</span> New words
+              <span>02</span> Script &amp; expression
             </div>
             <div className="script-card">
               <div className="script-toolbar">
-                <span className="mini-label">Message draft</span>
-                <span className="script-meta">English · conversational</span>
+                <span className="mini-label">Message draft + cues</span>
+                <span className="script-meta">English · exact words</span>
               </div>
               <textarea
-                aria-label="Words to be spoken"
+                ref={scriptInput}
+                aria-label="Words to be spoken with expression cues"
                 value={script}
                 disabled={busy}
                 onChange={event => {
@@ -971,21 +1032,97 @@ export default function Home() {
                 placeholder="Write the words you want spoken..."
                 maxLength={MAX_SCRIPT_LENGTH}
               />
+              <div className="expression-cue-toolbar">
+                <div className="cue-group">
+                  <span className="mini-label">Mood</span>
+                  <div className="cue-buttons">
+                    {(["neutral", "playful", "excited", "sad", "calm"] as const).map(mood => (
+                      <button
+                        className="cue-button"
+                        key={mood}
+                        type="button"
+                        disabled={busy}
+                        onClick={() => insertExpressionCue(`[mood:${mood}]`)}
+                      >
+                        {mood}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="cue-group">
+                  <span className="mini-label">Vocal moment</span>
+                  <div className="cue-buttons">
+                    {([
+                      ["laugh", "Laugh"],
+                      ["giggle", "Giggle"],
+                      ["sob", "Sob"],
+                    ] as const).map(([cue, label]) => (
+                      <button
+                        className="cue-button cue-button-event"
+                        key={cue}
+                        type="button"
+                        disabled={busy}
+                        onClick={() => insertExpressionCue(`[${cue}]`)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
               <div className="script-footer">
                 <span className="tip">
-                  <Sparkles size={13} /> Punctuation shapes the pauses.
+                  <Sparkles size={13} /> Punctuation shapes pauses; cues are removed before speech.
                 </span>
                 <span className="char-count">{script.length} / 1,200</span>
               </div>
             </div>
+            <div className="expression-sample-panel">
+              <div className="sample-panel-heading">
+                <span className="mini-label">Original-speaker vocal samples</span>
+                <p>Needed only for matching cues; only referenced clips upload.</p>
+              </div>
+              <div className="expression-samples">
+                <UploadCard
+                  kind="laugh"
+                  file={laughSample}
+                  disabled={busy}
+                  onSelect={file => setFile("laugh", file)}
+                  onClear={() => {
+                    setLaughSample(null);
+                    resetOutput();
+                  }}
+                />
+                <UploadCard
+                  kind="sob"
+                  file={sobSample}
+                  disabled={busy}
+                  onSelect={file => setFile("sob", file)}
+                  onClear={() => {
+                    setSobSample(null);
+                    resetOutput();
+                  }}
+                />
+              </div>
+              <p
+                className={`expression-status ${expression.missingSamples.length || expression.tooManyVocalizations ? "is-error" : ""}`}
+                aria-live="polite"
+              >
+                {expression.tooManyVocalizations
+                  ? "Use no more than six laugh, giggle, or sob cues in one take."
+                  : expression.missingSamples.length
+                    ? `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample to use those cues.`
+                    : "Mood shifts are approximate; laugh, giggle, and sob cues insert your supplied speaker sample."}
+              </p>
+            </div>
             <div className="script-preview-row">
               <div>
-                <span className="muted-label">Estimated read</span>
+                <span className="muted-label">Estimated speech</span>
                 <strong>{estimatedSeconds}</strong>
               </div>
               <div>
                 <span className="muted-label">Delivery</span>
-                <strong>Identity priority</strong>
+                <strong>Cue-directed · approximate</strong>
               </div>
               <button
                 className="reset-button"
@@ -1007,8 +1144,9 @@ export default function Home() {
                 onChange={event => setConsent(event.target.checked)}
               />
               <span>
-                I have permission from both speakers to use and transform these
-                recordings, and to process them through Colab and Gradio.
+                I have permission from both reference speakers, and from the
+                original speaker for any laugh/giggle or cry/sob sample, to
+                process these recordings through temporary Colab and Gradio sessions.
               </span>
             </label>
           </section>
@@ -1036,11 +1174,10 @@ export default function Home() {
                   )}
                   <p className="output-caveat">
                     Pronunciation Guard checks every requested word locally after conversion.
-                    The refined profile uses more sampling steps and stronger
-                    reference guidance, so it can take longer on a free T4.
-                    The final pass targets your original speaker, but the
-                    result is still experimental and may trade accent strength
-                    against identity. Keep this page and Colab open.
+                    Mood cues use small pitch/rate shifts and may sound subtle.
+                    Laugh/giggle/sob cues insert your uploaded original-speaker
+                    sample. No numeric speaker-likeness score is guaranteed.
+                    Keep this page and Colab open.
                   </p>
                 </div>
               ) : generationState === "complete" && outputUrl ? (
@@ -1064,9 +1201,10 @@ export default function Home() {
                     <Download size={16} /> Download WAV
                   </a>
                   <p className="output-caveat">
-                    Compare this take with both references. The final pass
-                    prioritizes original-speaker timbre, but identity,
-                    naturalness and accent are not guaranteed matches.
+                    Compare this take with both references. Mood delivery is
+                    approximate; vocal moments are the supplied speaker sample.
+                    Identity, naturalness, accent, and an 85–95% likeness are
+                    not guaranteed.
                   </p>
                 </div>
               ) : generationState === "error" ? (
@@ -1095,8 +1233,8 @@ export default function Home() {
                   <h2>Your new line will land here.</h2>
                   <p>
                     {connectionState === "connected"
-                      ? "Load both references, write your message, and confirm speaker permission."
-                      : "Connect your running Colab session above. Then load both references and write your message."}
+                      ? "Load both references, write your line, add cues if useful, and confirm permission."
+                      : "Connect Colab above, load both references, then write your line and cue its delivery."}
                   </p>
                   <div className="output-spec">
                     <span>Output</span>
@@ -1129,7 +1267,7 @@ export default function Home() {
             )}
             <p className="provider-note">
               <LockKeyhole size={12} />
-              References upload only when you generate.
+              References upload when generating; event clips only upload when cued.
             </p>
           </aside>
         </section>
@@ -1140,24 +1278,26 @@ export default function Home() {
             <strong>
               An experimental voice-conversion tool, not a perfect voice clone.
             </strong>{" "}
-            Seed-VC now uses a text-safe two-pass pipeline with automatic
-            chunking for longer messages and a duration guard on every segment.
-            The original recording remains the final identity reference while
-            the accent reference guides pronunciation and style. Pronunciation
-            Guard verifies every generated word locally before returning audio. This may still
-            change identity, accent or pronunciation; closer similarity and
-            naturalness need a listening comparison, not a guarantee. The script
-            is sent to Microsoft’s Edge speech service to make a temporary
-            neutral intermediate; the final output must come from Seed-VC
-            conversion. Audio passes through Gradio sharing and is processed
-            temporarily on your Colab runtime. Don’t use sensitive scripts or
-            recordings.
+            The current identity-anchored v3 text-safe baseline uses two passes,
+            chunks speech, and verifies spoken words before returning audio.
+            The original recording guides identity and the accent reference
+            guides accent/style; the model does not perfectly separate them.
+            Mood cues only apply small supported pitch/rate changes, so their
+            effect is approximate. Laugh, giggle, and sob cues insert the
+            original speaker’s supplied event sample; AccentLab does not claim
+            to synthesize those sounds. Write your own joke and mark its
+            delivery—jokes are not generated or detected automatically. No
+            85–95% speaker-similarity guarantee is available. Microsoft’s Edge
+            speech service receives the script to make a temporary scaffold;
+            Seed-VC must produce the final converted speech. Audio passes
+            through Gradio sharing and is processed temporarily on Colab. Don’t
+            use sensitive scripts or recordings.
           </p>
         </section>
         <section className="how-it-works">
           <div className="how-title">
             <span className="eyebrow">A considered workflow</span>
-            <h2>Two references. One new take.</h2>
+            <h2>Two references. Your directed take.</h2>
           </div>
           <div className="how-step">
             <span className="how-number">01</span>
@@ -1172,7 +1312,7 @@ export default function Home() {
           <div className="how-step">
             <span className="how-number">03</span>
             <strong>Generate</strong>
-            <p>Send the references and new text to Colab.</p>
+            <p>Colab converts verified speech and places marked voice moments.</p>
           </div>
         </section>
       </main>

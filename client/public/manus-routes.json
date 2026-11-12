@@ -1,6 +1,1 @@
-{
-  "routes": [
-    { "path": "/", "title": "AccentLab Studio" },
-    { "path": "/404", "title": "Not found" }
-  ]
-}
+{"routes":[{"path":"/","title":"AccentLab Studio"}]}

@@ -1,9 +1,14 @@
 import { Client, handle_file } from "@gradio/client";
+import {
+  analyzeExpressionScript,
+  MAX_VOCALIZATION_CUES,
+} from "./expression-cues";
 
 export const AUDIO_ACCEPT = ".wav,.mp3,.m4a,.ogg,.webm,.aac,.flac";
 export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 export const MAX_SCRIPT_LENGTH = 1200;
-export const REQUIRED_PIPELINE_VERSION = "identity-anchored-v3-text-safe";
+export const REQUIRED_PIPELINE_VERSION =
+  "identity-anchored-v4-expressive-text-safe";
 const CONNECT_TIMEOUT_MS = 45_000;
 const GENERATE_TIMEOUT_MS = 15 * 60_000;
 
@@ -25,6 +30,8 @@ export interface GenerationInput {
   accentReference: File;
   script: string;
   consent: boolean;
+  laughSample?: File | null;
+  sobSample?: File | null;
 }
 
 export function normalizeEndpoint(raw: string): string {
@@ -63,7 +70,7 @@ export function validateAudio(file: Pick<File, "name" | "size">): void {
     throw new Error("This recording is empty. Choose another audio file.");
   if (file.size > MAX_AUDIO_BYTES) {
     throw new Error(
-      "Each reference must be 20 MB or smaller. Use a clean 5–30 second excerpt."
+      "Each audio file must be 20 MB or smaller. Use a clean, short recording."
     );
   }
 }
@@ -263,6 +270,25 @@ export class ColabConnection {
       throw new Error(
         "Confirm that you have permission from both speakers before generating."
       );
+    const expression = analyzeExpressionScript(
+      script,
+      Boolean(input.laughSample),
+      Boolean(input.sobSample)
+    );
+    if (!expression.hasSpeech && !expression.hasVocalization)
+      throw new Error("Write spoken words or add a laugh, giggle, or sob cue.");
+    if (expression.missingSamples.length)
+      throw new Error(
+        `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample before generating.`
+      );
+    if (expression.tooManyVocalizations)
+      throw new Error(
+        `Use no more than ${MAX_VOCALIZATION_CUES} laugh, giggle, or sob cues per take.`
+      );
+    if (expression.needsLaughSample && input.laughSample)
+      validateAudio(input.laughSample);
+    if (expression.needsSobSample && input.sobSample)
+      validateAudio(input.sobSample);
     if (signal?.aborted)
       throw new Error(
         "Stopped listening. A job already running on Colab may still finish."
@@ -271,7 +297,7 @@ export class ColabConnection {
     // Do not let a runtime that was replaced after connection silently use the
     // old pipeline. This readiness check sends only the session code, not audio.
     onProgress({
-      message: "Checking the identity-anchored model before upload…",
+      message: "Checking the expressive text-safe model before upload…",
     });
     try {
       const response = await withTimeout(
@@ -299,6 +325,12 @@ export class ColabConnection {
       script,
       this.accessKey,
       true,
+      expression.needsLaughSample && input.laughSample
+        ? handle_file(input.laughSample)
+        : null,
+      expression.needsSobSample && input.sobSample
+        ? handle_file(input.sobSample)
+        : null,
     ]);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let rejectStop: (error: Error) => void = () => undefined;

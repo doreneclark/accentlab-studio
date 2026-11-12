@@ -1,4 +1,4 @@
-"""AccentLab experimental two-reference Seed-VC v2 backend.
+"""AccentLab experimental two-reference Seed-VC v4 expressive backend.
 
 This module runs from a pinned checkout of the official Seed-VC repository in a
 free Google Colab T4 runtime. It is an experimental approximation, not a model-
@@ -9,8 +9,8 @@ The public Gradio API is intentionally small and stable:
 
 * ``/status``: ``access_key: str`` -> JSON with ``ready``, ``gpu``,
   ``sample_rate``, ``pipeline_version`` and ``message`` for authorized callers.
-* ``/generate``: ``source_voice: filepath``, ``accent_reference: filepath``,
-  ``script: str``, ``access_key: str``, ``consent: bool`` -> an audio filepath.
+* ``/generate``: source/accent references, tagged script, access code, consent,
+  and optional original-speaker laugh/giggle and sob samples -> an audio filepath.
 
 The access key is generated at process launch and is never stored in this
 source file. The caller must supply it for both endpoints.
@@ -43,9 +43,9 @@ import yaml
 # lets the Python file be run directly after the same installation cell.
 SEED_VC_ROOT = Path(os.environ.get("SEED_VC_ROOT", "/content/seed-vc"))
 SEED_VC_COMMIT = "51383efd921027683c89e5348211d93ff12ac2a8"
-PIPELINE_VERSION = "identity-anchored-v3-text-safe"
-# V2 is a conservative quality trial: more diffusion steps and gradually
-# stronger conditioning toward the relevant source/accent references.
+PIPELINE_VERSION = "identity-anchored-v4-expressive-text-safe"
+# Preserve the current text-safe two-pass conversion settings. The upstream
+# Seed-VC model is v2; these are not a measured identity-similarity score.
 DIFFUSION_STEPS = 50
 ACCENT_TO_SOURCE_SIMILARITY = 0.93
 BLENDED_PROMPT_SIMILARITY = 0.80
@@ -54,10 +54,24 @@ MAX_SCRIPT_CHARS = 1200
 CHUNK_TARGET_CHARS = 260
 TTS_RETRIES = 3
 CHUNK_GAP_SECONDS = 0.08
+MAX_VOCALIZATION_CUES = 6
+MAX_VOCALIZATION_DECODE_SECONDS = 12.0
+MAX_VOCALIZATION_SECONDS = 8.0
 MAX_REFERENCE_DECODE_SECONDS = 30.0
 MAX_REFERENCE_SECONDS = 25.0
 REFERENCE_SILENCE_TOP_DB = 40.0
 NEAR_SILENT_PEAK = 1e-4
+EXPRESSION_CUE_PATTERN = re.compile(
+    r"\[(mood:(?:neutral|playful|excited|sad|calm)|laugh|giggle|sob)\]",
+    re.IGNORECASE,
+)
+MOOD_PROSODY = {
+    "neutral": {"rate": "+0%", "pitch": "+0Hz"},
+    "playful": {"rate": "+4%", "pitch": "+2Hz"},
+    "excited": {"rate": "+7%", "pitch": "+3Hz"},
+    "sad": {"rate": "-7%", "pitch": "-2Hz"},
+    "calm": {"rate": "-4%", "pitch": "-1Hz"},
+}
 OUTPUT_RETENTION_SECONDS = 60 * 60
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "accentlab_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,6 +343,55 @@ def _validate_audio(path: Any, label: str) -> str:
     return path
 
 
+def _parse_expression_script(script: str) -> list[dict[str, Any]]:
+    """Separate explicit mood and vocalization controls from spoken words."""
+    segments: list[dict[str, Any]] = []
+    mood = "neutral"
+    cursor = 0
+
+    def add_speech(value: str) -> None:
+        text = value.strip()
+        if text:
+            segments.append({"kind": "speech", "text": text, "mood": mood})
+
+    for match in EXPRESSION_CUE_PATTERN.finditer(script):
+        add_speech(script[cursor : match.start()])
+        cue = match.group(1).lower()
+        if cue.startswith("mood:"):
+            mood = cue.split(":", 1)[1]
+        else:
+            segments.append({"kind": "vocalization", "cue": cue})
+        cursor = match.end()
+    add_speech(script[cursor:])
+    return segments
+
+
+def _prepare_vocalization(path: str, label: str) -> tuple[int, np.ndarray]:
+    """Decode one finite event sample, trim only edge silence, and cap its duration."""
+    wave, sample_rate = librosa.load(
+        path,
+        sr=SAMPLE_RATE,
+        mono=True,
+        duration=MAX_VOCALIZATION_DECODE_SECONDS,
+    )
+    if wave.size == 0 or not np.isfinite(wave).all():
+        raise ValueError(f"{label} contains no usable finite audio.")
+    if float(np.max(np.abs(wave))) <= NEAR_SILENT_PEAK:
+        raise ValueError(f"{label} is silent or near-silent.")
+    trimmed, _ = librosa.effects.trim(
+        wave,
+        top_db=REFERENCE_SILENCE_TOP_DB,
+        frame_length=2048,
+        hop_length=512,
+    )
+    trimmed = trimmed[: int(MAX_VOCALIZATION_SECONDS * sample_rate)]
+    if trimmed.size < int(0.15 * sample_rate) or not np.isfinite(trimmed).all():
+        raise ValueError(f"{label} is too short or unusable after preparation.")
+    if float(np.max(np.abs(trimmed))) <= NEAR_SILENT_PEAK:
+        raise ValueError(f"{label} is silent or near-silent after preparation.")
+    return SAMPLE_RATE, trimmed.astype(np.float32, copy=False)
+
+
 def _prepare_reference(original_path: str, prepared_path: Path, label: str) -> None:
     """Decode up to 30 seconds, trim edge silence, then retain at most 25 seconds."""
     wave, sample_rate = librosa.load(
@@ -358,20 +421,26 @@ def _prepare_reference(original_path: str, prepared_path: Path, label: str) -> N
     sf.write(prepared_path, trimmed, sample_rate, subtype="PCM_16")
 
 
-async def _tts_to_mp3(text: str, output_path: str) -> None:
-    # This is deliberately a neutral, temporary content scaffold. Edge TTS
-    # outputs MP3; _make_neutral_speech converts it to a valid WAV below.
-    communicate = edge_tts.Communicate(text, "en-US-JennyNeural", rate="+0%")
+async def _tts_to_mp3(text: str, output_path: str, mood: str) -> None:
+    # Edge TTS exposes prosody controls, not named-emotion synthesis. These
+    # small changes are experimental cues on a temporary content scaffold.
+    prosody = MOOD_PROSODY.get(mood, MOOD_PROSODY["neutral"])
+    communicate = edge_tts.Communicate(
+        text,
+        "en-US-JennyNeural",
+        rate=prosody["rate"],
+        pitch=prosody["pitch"],
+    )
     await communicate.save(output_path)
 
 
-def _make_neutral_speech(text: str, output_path: str) -> None:
-    """Create a verified neutral scaffold, retrying transient TTS failures."""
+def _make_neutral_speech(text: str, output_path: str, mood: str = "neutral") -> None:
+    """Create a prosody-directed scaffold, retrying transient TTS failures."""
     last_error: Exception | None = None
     for attempt in range(TTS_RETRIES):
         mp3_path = f"{output_path}.attempt{attempt}.mp3"
         try:
-            asyncio.run(_tts_to_mp3(text, mp3_path))
+            asyncio.run(_tts_to_mp3(text, mp3_path, mood))
             from pydub import AudioSegment
 
             AudioSegment.from_file(mp3_path, format="mp3").set_channels(1).set_frame_rate(
@@ -521,9 +590,11 @@ def _generate(
     script: str,
     access_key: str,
     consent: bool,
+    laugh_sample: str | None = None,
+    sob_sample: str | None = None,
     progress=gr.Progress(),
 ) -> str:
-    """Generate the final output using a two-pass text-safe approximation. The final pass is deliberately removed because it can erase words."""
+    """Generate verified speech and insert explicitly requested speaker samples."""
     # Authenticate before touching the model or starting any GPU conversion.
     if not _key_is_valid(access_key):
         raise gr.Error("Invalid access code.")
@@ -532,15 +603,45 @@ def _generate(
     if MODEL is None:
         raise gr.Error(MODEL_ERROR or "Seed-VC v2 is not ready yet.")
     if consent is not True:
-        raise gr.Error("Confirm that you have permission to transform both recordings.")
+        raise gr.Error(
+            "Confirm permission for both references and any original-speaker vocalization samples."
+        )
     if not isinstance(script, str) or not script.strip():
-        raise gr.Error("Enter the words to be spoken.")
+        raise gr.Error("Enter spoken words or an explicit vocalization cue.")
     if len(script) > MAX_SCRIPT_CHARS:
         raise gr.Error(f"Text is limited to {MAX_SCRIPT_CHARS} characters.")
+
+    script_segments = _parse_expression_script(script)
+    if not script_segments:
+        raise gr.Error("Enter spoken words or an explicit vocalization cue.")
+    vocalization_cues = [
+        segment["cue"]
+        for segment in script_segments
+        if segment["kind"] == "vocalization"
+    ]
+    if len(vocalization_cues) > MAX_VOCALIZATION_CUES:
+        raise gr.Error(
+            f"Use no more than {MAX_VOCALIZATION_CUES} laugh, giggle, or sob cues per take."
+        )
+    needs_laugh_sample = any(cue in ("laugh", "giggle") for cue in vocalization_cues)
+    needs_sob_sample = "sob" in vocalization_cues
+    has_speech = any(segment["kind"] == "speech" for segment in script_segments)
+    if not has_speech and not vocalization_cues:
+        raise gr.Error("Enter spoken words or an explicit vocalization cue.")
+    if needs_laugh_sample and not laugh_sample:
+        raise gr.Error("Add the original speaker's laugh/giggle sample for this cue.")
+    if needs_sob_sample and not sob_sample:
+        raise gr.Error("Add the original speaker's cry/sob sample for this cue.")
 
     try:
         source_path = _validate_audio(source_voice, "Original voice")
         accent_path = _validate_audio(accent_reference, "French-accent reference")
+        if needs_laugh_sample:
+            laugh_sample = _validate_audio(
+                laugh_sample, "Original-speaker laugh/giggle sample"
+            )
+        if needs_sob_sample:
+            sob_sample = _validate_audio(sob_sample, "Original-speaker cry/sob sample")
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
     if not GENERATION_LOCK.acquire(blocking=False):
@@ -556,37 +657,69 @@ def _generate(
             _prepare_reference(accent_path, prepared_accent, "French-accent reference")
             source_path, accent_path = str(prepared_source), str(prepared_accent)
             blended_prompt = work / "accent_reference_in_source_voice.wav"
-            chunks = _split_script(script)
-            converted_chunks: list[tuple[int, np.ndarray]] = []
+            actions: list[dict[str, Any]] = []
+            for segment in script_segments:
+                if segment["kind"] == "vocalization":
+                    actions.append(segment)
+                    continue
+                for text_chunk in _split_script(segment["text"]):
+                    actions.append(
+                        {
+                            "kind": "speech",
+                            "text": text_chunk,
+                            "mood": segment["mood"],
+                        }
+                    )
+            output_chunks: list[tuple[int, np.ndarray]] = []
+            event_audio: dict[str, tuple[int, np.ndarray]] = {}
+            if needs_laugh_sample and laugh_sample:
+                event_audio["laugh"] = _prepare_vocalization(
+                    laugh_sample, "Original-speaker laugh/giggle sample"
+                )
+            if needs_sob_sample and sob_sample:
+                event_audio["sob"] = _prepare_vocalization(
+                    sob_sample, "Original-speaker cry/sob sample"
+                )
 
-            progress(0.05, desc="Preparing the two reference recordings")
+            progress(0.05, desc="Preparing the reference recordings and expression cues")
 
-            # Pass 1 is performed once: accent -> original, timbre-focused and
-            # without AR style rewrite. Every text chunk reuses this prompt.
-            progress(0.15, desc="Adapting the accent reference to the original voice")
-            stage1_sr, stage1_audio = _convert_once(
-                MODEL,
-                accent_path,
-                source_path,
-                convert_style=False,
-                similarity_cfg_rate=ACCENT_TO_SOURCE_SIMILARITY,
-            )
-            _write_safe_wav(blended_prompt, stage1_audio, stage1_sr)
+            # Keep the text-safe two-pass baseline. A third direct-source pass
+            # is intentionally absent because it could erase requested words.
+            if has_speech:
+                progress(0.15, desc="Adapting the accent reference to the original voice")
+                stage1_sr, stage1_audio = _convert_once(
+                    MODEL,
+                    accent_path,
+                    source_path,
+                    convert_style=False,
+                    similarity_cfg_rate=ACCENT_TO_SOURCE_SIMILARITY,
+                )
+                _write_safe_wav(blended_prompt, stage1_audio, stage1_sr)
 
-            # Pass 2 converts each short neutral-TTS chunk independently. This
-            # preserves the original two-pass Colab design while limiting word
-            # loss to a small segment when scripts are long.
-            for index, chunk in enumerate(chunks):
-                neutral_wav = work / f"neutral_tts_{index}.wav"
-                stage2_wav = work / f"new_speech_{index}.wav"
-                _make_neutral_speech(chunk, str(neutral_wav))
+            for index, action in enumerate(actions):
+                action_number = index + 1
+                if action["kind"] == "vocalization":
+                    cue = action["cue"]
+                    event_key = "laugh" if cue in ("laugh", "giggle") else "sob"
+                    output_chunks.append(event_audio[event_key])
+                    progress(
+                        0.20 + 0.65 * (action_number / len(actions)),
+                        desc=f"Inserting the original-speaker {cue} sample.",
+                    )
+                    continue
+
+                chunk = action["text"]
+                mood = action["mood"]
+                neutral_wav = work / f"mood_scaffold_{action_number}.wav"
+                stage2_wav = work / f"new_speech_{action_number}.wav"
+                _make_neutral_speech(chunk, str(neutral_wav), mood)
                 progress(
-                    0.20 + 0.65 * ((index + 1) / len(chunks)),
-                    desc=f"Generating speech segment {index + 1} of {len(chunks)}",
+                    0.20 + 0.65 * ((action_number - 0.5) / len(actions)),
+                    desc=f"Preparing {mood} speech segment {action_number} of {len(actions)}",
                 )
                 progress(
-                    0.20 + 0.65 * (index / len(chunks)),
-                    desc=f"Converting speech segment {index + 1} of {len(chunks)}",
+                    0.20 + 0.65 * ((action_number - 1) / len(actions)),
+                    desc=f"Converting speech segment {action_number} of {len(actions)}",
                 )
                 segment_result: tuple[int, np.ndarray] | None = None
                 last_verification: dict[str, Any] | None = None
@@ -597,8 +730,8 @@ def _generate(
                         conversion_repetition = 1.5
                     else:
                         progress(
-                            0.20 + 0.65 * (index / len(chunks)),
-                            desc=f"Retrying segment {index + 1} because words were missing.",
+                            0.20 + 0.65 * ((action_number - 1) / len(actions)),
+                            desc=f"Retrying segment {action_number} because words were missing.",
                         )
                         conversion_steps = RETRY_DIFFUSION_STEPS
                         conversion_similarity = RETRY_SIMILARITY
@@ -617,38 +750,38 @@ def _generate(
                     actual_seconds = float(np.asarray(stage2_audio).shape[-1]) / float(stage2_sr)
                     if actual_seconds < max(0.8, expected_seconds * 0.55):
                         raise gr.Error(
-                            f"Speech segment {index + 1} was much shorter than requested. "
+                            f"Speech segment {action_number} was much shorter than requested. "
                             "No incomplete audio was returned; retry with shorter text."
                         )
                     last_verification = _verify_chunk(str(stage2_wav), chunk)
                     if last_verification["ok"]:
                         progress(
-                            0.20 + 0.65 * ((index + 1) / len(chunks)),
-                            desc=f"All requested words detected in segment {index + 1}.",
+                            0.20 + 0.65 * (action_number / len(actions)),
+                            desc=f"All requested words detected in segment {action_number}.",
                         )
                         segment_result = (stage2_sr, stage2_audio)
                         break
                     if last_verification["uncertain"]:
                         raise gr.Error(
-                            f"Verification uncertain for segment {index + 1}; please listen carefully. "
+                            f"Verification uncertain for segment {action_number}; please listen carefully. "
                             "No unverified audio was returned."
                         )
                     if attempt == PRONUNCIATION_MAX_ATTEMPTS:
                         missing = ", ".join(last_verification["missing"][:8]) or "some words"
                         raise gr.Error(
-                            f"Could not verify segment {index + 1} after {PRONUNCIATION_MAX_ATTEMPTS} attempts; "
+                            f"Could not verify segment {action_number} after {PRONUNCIATION_MAX_ATTEMPTS} attempts; "
                             f"missing: {missing}. No unverified audio was returned."
                         )
                 if segment_result is None:
                     raise gr.Error(
-                        f"Could not verify segment {index + 1}. No unverified audio was returned."
+                        f"Could not verify segment {action_number}. No unverified audio was returned."
                     )
-                converted_chunks.append(segment_result)
+                output_chunks.append(segment_result)
 
-            output_sr, output_audio = _join_audio_chunks(converted_chunks)
+            output_sr, output_audio = _join_audio_chunks(output_chunks)
             output_path = OUTPUT_DIR / f"accentlab_{secrets.token_hex(12)}.wav"
             _write_safe_wav(output_path, output_audio, output_sr)
-            progress(1.0, desc="All requested words detected. Converted WAV ready")
+            progress(1.0, desc="All speech segments verified. Expressive WAV ready")
             return str(output_path)
     except gr.Error:
         raise
@@ -659,14 +792,14 @@ def _generate(
 
 
 def build_demo() -> gr.Blocks:
-    """Build Blocks with the exact /status and /generate API contracts."""
-    with gr.Blocks(title="AccentLab Seed-VC v2") as demo:
+    """Build Blocks with the exact v4 /status and /generate API contracts."""
+    with gr.Blocks(title="AccentLab Studio — expressive text-safe") as demo:
         gr.Markdown(
-            "## AccentLab — experimental two-pass text-safe conversion\n"
-            "Use only recordings you have permission to transform. This free Colab "
-            "runtime uses the original voice as the final identity reference and "
-            "the accent recording to guide pronunciation; it cannot guarantee "
-            "perfect identity, naturalness, or accent transfer."
+            "## AccentLab Studio — expressive text-safe conversion\n"
+            "Use only recordings you have permission to transform. Mood cues use "
+            "approximate rate/pitch changes. Laugh, giggle and sob cues insert "
+            "short samples recorded by the original speaker; they are not newly "
+            "synthesized. Identity, naturalness and accent transfer are experimental."
         )
         access_key = gr.Textbox(label="Access code", type="password")
         status_button = gr.Button("Check backend", visible=True)
@@ -679,29 +812,45 @@ def build_demo() -> gr.Blocks:
             queue=False,
         )
 
-        source_voice = gr.Audio(type="filepath", label="Original voice — final identity reference")
+        source_voice = gr.Audio(type="filepath", label="Original voice — identity guide")
         accent_reference = gr.Audio(type="filepath", label="French-accent reference — accent/style")
+        laugh_sample = gr.Audio(
+            type="filepath", label="Optional original-speaker laugh/giggle sample"
+        )
+        sob_sample = gr.Audio(
+            type="filepath", label="Optional original-speaker cry/sob sample"
+        )
         script = gr.Textbox(
             lines=7,
             max_lines=14,
             max_length=MAX_SCRIPT_CHARS,
-            label="New text (maximum 1200 characters)",
+            label="Script plus [mood:playful], [laugh], [giggle], or [sob] cues (maximum 1200 characters)",
         )
         consent = gr.Checkbox(
-            label="I have permission to transform both recordings.", value=False
+            label="I have permission to transform both references and any original-speaker event samples.",
+            value=False,
         )
         generate_button = gr.Button("Generate", variant="primary")
         result = gr.Audio(type="filepath", label="Converted WAV")
         generate_button.click(
             _generate,
-            inputs=[source_voice, accent_reference, script, access_key, consent],
+            inputs=[
+                source_voice,
+                accent_reference,
+                script,
+                access_key,
+                consent,
+                laugh_sample,
+                sob_sample,
+            ],
             outputs=[result],
             api_name="generate",
         )
         gr.Markdown(
             "The temporary shared URL is public to anyone who has it while this "
-            "Colab session runs. Uploaded audio and generated files are processed "
-            "in the temporary runtime; do not use sensitive recordings."
+            "Colab session runs. References, the event samples used by cues, and "
+            "generated files are processed in the temporary runtime; do not use "
+            "sensitive recordings."
         )
     return demo
 

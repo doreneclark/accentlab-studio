@@ -98,6 +98,45 @@ print(json.dumps(ast.literal_eval(assignment.value)))
     expect(start).toContain("demo.launch");
   });
 
+  it("preflights the same managed Seed-VC checkout cloned by its installer", () => {
+    const rootInspector = String.raw`
+import ast, json, sys
+tree = ast.parse(sys.stdin.read())
+def source_value(name):
+    assignment = next(
+        node for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    )
+    return ast.literal_eval(assignment.value)
+def checkout_root(source, variable):
+    child = ast.parse(source)
+    assignment = next(
+        node for node in child.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == variable for target in node.targets)
+    )
+    return ast.literal_eval(assignment.value.args[0])
+install = source_value("INSTALL_SOURCE")
+preflight = source_value("PREFLIGHT_SOURCE")
+print(json.dumps({
+    "installRoot": checkout_root(install, "root"),
+    "preflightRoot": checkout_root(preflight, "seed_vc_root"),
+}))
+`;
+    const result = JSON.parse(
+      execFileSync("python3", ["-c", rootInspector], {
+        input: workerSource,
+        encoding: "utf8",
+      })
+    ) as { installRoot: string; preflightRoot: string };
+
+    expect(result.installRoot).toBe("/content/accentlab-runtime/seed-vc");
+    expect(result.preflightRoot).toBe(result.installRoot);
+    expect(BOOTSTRAP_WORKER_SOURCE).toBe(workerSource);
+    expect(buildBootstrapStartCode()).toContain(result.installRoot);
+  });
+
   it("uses one locked worker, strict private status writes, and stale-process recovery", () => {
     const start = buildBootstrapStartCode();
     const status = buildBootstrapStatusCode();

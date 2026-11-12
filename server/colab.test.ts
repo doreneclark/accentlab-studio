@@ -50,6 +50,8 @@ function input() {
     ) as unknown as globalThis.File,
     script: "Hello, how are you?",
     consent: true,
+    laughSample: null,
+    sobSample: null,
   };
 }
 function submission(events: unknown[]) {
@@ -166,7 +168,7 @@ describe("Colab connection", () => {
 });
 
 describe("Colab generation", () => {
-  it("uploads both files, forwards all five inputs, reports progress, and returns downloaded audio", async () => {
+  it("uploads both references, forwards the seven-input v4 contract, reports progress, and returns audio", async () => {
     const job = submission([
       { type: "status", stage: "pending", position: 0 },
       {
@@ -197,6 +199,8 @@ describe("Colab generation", () => {
       value.script,
       accessKey,
       true,
+      null,
+      null,
     ]);
     expect(progress).toHaveBeenCalledWith({
       message: "Blending references",
@@ -208,6 +212,49 @@ describe("Colab generation", () => {
     );
     expect(output.type).toBe("audio/wav");
     expect(output.size).toBeGreaterThan(0);
+  });
+  it("uploads only the event sample used by the script cue", async () => {
+    const job = submission([
+      {
+        type: "data",
+        data: [{ url: `${endpoint}/gradio_api/file=result.wav` }],
+      },
+    ]);
+    const remote = client({ submit: vi.fn().mockReturnValue(job) });
+    mocks.connect.mockResolvedValue(remote);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" }))
+      )
+    );
+    const connection = await ColabConnection.connect(endpoint, accessKey);
+    const value = {
+      ...input(),
+      script: "[mood:playful]That was funny. [giggle]",
+      laughSample: new File(["laugh"], "laugh.wav") as unknown as globalThis.File,
+    };
+    await connection.generate(value, vi.fn());
+    expect(remote.submit).toHaveBeenCalledWith("/generate", [
+      { upload: value.sourceVoice },
+      { upload: value.accentReference },
+      value.script,
+      accessKey,
+      true,
+      { upload: value.laughSample },
+      null,
+    ]);
+    expect(mocks.handleFile).toHaveBeenCalledTimes(3);
+  });
+  it("does not upload references or queue a vocal cue without its original-speaker sample", async () => {
+    const remote = client();
+    mocks.connect.mockResolvedValue(remote);
+    const connection = await ColabConnection.connect(endpoint, accessKey);
+    await expect(
+      connection.generate({ ...input(), script: "[laugh]" }, vi.fn())
+    ).rejects.toThrow("Add the original speaker’s laugh/giggle sample");
+    expect(remote.submit).not.toHaveBeenCalled();
+    expect(mocks.handleFile).not.toHaveBeenCalled();
   });
   it("does not upload without explicit speaker consent", async () => {
     const remote = client();
