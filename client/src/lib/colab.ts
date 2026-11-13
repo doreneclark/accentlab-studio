@@ -1,4 +1,4 @@
-import { Client, handle_file } from "@gradio/client";
+import type { Client as GradioClient } from "@gradio/client";
 import {
   analyzeExpressionScript,
   MAX_VOCALIZATION_CUES,
@@ -213,7 +213,8 @@ function requireIdentityPipeline(
 export class ColabConnection {
   private closed = false;
   private constructor(
-    private readonly client: Client,
+    private readonly client: GradioClient,
+    private readonly handleFile: typeof import("@gradio/client").handle_file,
     readonly endpoint: string,
     private readonly accessKey: string,
     readonly status: ColabStatus,
@@ -238,7 +239,8 @@ export class ColabConnection {
       );
     const providerName =
       provider === "Hugging Face" ? "Hugging Face Space" : "Colab";
-    let client: Client | undefined;
+    const { Client, handle_file: handleFile } = await import("@gradio/client");
+    let client: GradioClient | undefined;
     let abandoned = false;
     const pending = Client.connect(endpoint, {
       events: ["status", "data"],
@@ -306,7 +308,14 @@ export class ColabConnection {
         );
       }
       requireIdentityPipeline(status, provider);
-      return new ColabConnection(client, endpoint, accessKey, status, provider);
+      return new ColabConnection(
+        client,
+        handleFile,
+        endpoint,
+        accessKey,
+        status,
+        provider
+      );
     } catch (error) {
       abandoned = true;
       client?.close();
@@ -393,16 +402,16 @@ export class ColabConnection {
       message: `Uploading references to your ${this.provider} session…`,
     });
     const job = this.client.submit("/generate", [
-      handle_file(input.sourceVoice),
-      handle_file(input.accentReference),
+      this.handleFile(input.sourceVoice),
+      this.handleFile(input.accentReference),
       script,
       this.accessKey,
       true,
       expression.hasLaughCue && input.laughSample
-        ? handle_file(input.laughSample)
+        ? this.handleFile(input.laughSample)
         : null,
       expression.needsSobSample && input.sobSample
-        ? handle_file(input.sobSample)
+        ? this.handleFile(input.sobSample)
         : null,
     ]);
     let timer: ReturnType<typeof setTimeout> | undefined;
