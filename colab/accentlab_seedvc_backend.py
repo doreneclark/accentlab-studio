@@ -1,4 +1,4 @@
-"""AccentLab experimental two-reference Seed-VC v4 expressive backend.
+"""AccentLab experimental two-reference Seed-VC v5 expressive backend.
 
 This module runs from a pinned checkout of the official Seed-VC repository in a
 free Google Colab T4 runtime. It is an experimental approximation, not a model-
@@ -43,7 +43,7 @@ import yaml
 # lets the Python file be run directly after the same installation cell.
 SEED_VC_ROOT = Path(os.environ.get("SEED_VC_ROOT", "/content/seed-vc"))
 SEED_VC_COMMIT = "51383efd921027683c89e5348211d93ff12ac2a8"
-PIPELINE_VERSION = "identity-anchored-v4-expressive-text-safe"
+PIPELINE_VERSION = "identity-anchored-v5-expressive-text-safe"
 # Preserve the current text-safe two-pass conversion settings. The upstream
 # Seed-VC model is v2; these are not a measured identity-similarity score.
 DIFFUSION_STEPS = 50
@@ -623,20 +623,25 @@ def _generate(
         raise gr.Error(
             f"Use no more than {MAX_VOCALIZATION_CUES} laugh, giggle, or sob cues per take."
         )
-    needs_laugh_sample = any(cue in ("laugh", "giggle") for cue in vocalization_cues)
+    has_laugh_cue = any(cue in ("laugh", "giggle") for cue in vocalization_cues)
     needs_sob_sample = "sob" in vocalization_cues
     has_speech = any(segment["kind"] == "speech" for segment in script_segments)
     if not has_speech and not vocalization_cues:
         raise gr.Error("Enter spoken words or an explicit vocalization cue.")
-    if needs_laugh_sample and not laugh_sample:
-        raise gr.Error("Add the original speaker's laugh/giggle sample for this cue.")
     if needs_sob_sample and not sob_sample:
         raise gr.Error("Add the original speaker's cry/sob sample for this cue.")
+    has_laugh_audio = has_laugh_cue and bool(laugh_sample)
+    has_sob_audio = needs_sob_sample and bool(sob_sample)
+    if not has_speech and not (has_laugh_audio or has_sob_audio):
+        raise gr.Error(
+            "No spoken words remain after skipping optional laugh/giggle cues. "
+            "Add spoken text or provide an original-speaker sample for a vocalization-only take."
+        )
 
     try:
         source_path = _validate_audio(source_voice, "Original voice")
         accent_path = _validate_audio(accent_reference, "French-accent reference")
-        if needs_laugh_sample:
+        if has_laugh_audio:
             laugh_sample = _validate_audio(
                 laugh_sample, "Original-speaker laugh/giggle sample"
             )
@@ -672,7 +677,7 @@ def _generate(
                     )
             output_chunks: list[tuple[int, np.ndarray]] = []
             event_audio: dict[str, tuple[int, np.ndarray]] = {}
-            if needs_laugh_sample and laugh_sample:
+            if has_laugh_cue and laugh_sample:
                 event_audio["laugh"] = _prepare_vocalization(
                     laugh_sample, "Original-speaker laugh/giggle sample"
                 )
@@ -701,6 +706,16 @@ def _generate(
                 if action["kind"] == "vocalization":
                     cue = action["cue"]
                     event_key = "laugh" if cue in ("laugh", "giggle") else "sob"
+                    if event_key not in event_audio:
+                        if event_key != "laugh":
+                            raise gr.Error(
+                                "Add the original speaker's cry/sob sample for this cue."
+                            )
+                        progress(
+                            0.20 + 0.65 * (action_number / len(actions)),
+                            desc=f"Skipping the {cue} cue; no optional laugh/giggle sample was supplied.",
+                        )
+                        continue
                     output_chunks.append(event_audio[event_key])
                     progress(
                         0.20 + 0.65 * (action_number / len(actions)),
@@ -797,9 +812,10 @@ def build_demo() -> gr.Blocks:
         gr.Markdown(
             "## AccentLab Studio — expressive text-safe conversion\n"
             "Use only recordings you have permission to transform. Mood cues use "
-            "approximate rate/pitch changes. Laugh, giggle and sob cues insert "
-            "short samples recorded by the original speaker; they are not newly "
-            "synthesized. Identity, naturalness and accent transfer are experimental."
+            "approximate rate/pitch changes. Laugh/giggle samples are optional; "
+            "without one, those cues are skipped. A [sob] cue requires a short "
+            "original-speaker cry/sob sample. Supplied clips are inserted, not "
+            "newly synthesized. Identity, naturalness and accent transfer are experimental."
         )
         access_key = gr.Textbox(label="Access code", type="password")
         status_button = gr.Button("Check backend", visible=True)
@@ -818,7 +834,7 @@ def build_demo() -> gr.Blocks:
             type="filepath", label="Optional original-speaker laugh/giggle sample"
         )
         sob_sample = gr.Audio(
-            type="filepath", label="Optional original-speaker cry/sob sample"
+            type="filepath", label="Required original-speaker cry/sob sample for [sob]"
         )
         script = gr.Textbox(
             lines=7,

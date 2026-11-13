@@ -21,8 +21,9 @@ export interface ExpressionAnalysis {
   spokenText: string;
   hasSpeech: boolean;
   hasVocalization: boolean;
-  needsLaughSample: boolean;
+  hasLaughCue: boolean;
   needsSobSample: boolean;
+  hasRenderableVocalization: boolean;
   missingSamples: string[];
   vocalizationCount: number;
   tooManyVocalizations: boolean;
@@ -68,11 +69,14 @@ export function analyzeExpressionScript(
       segment.kind === "vocalization"
   );
   const spokenText = speechSegments.map(segment => segment.text).join(" ");
-  const needsLaughSample = vocalizationSegments.some(
+  const hasLaughCue = vocalizationSegments.some(
     segment => segment.cue === "laugh" || segment.cue === "giggle"
   );
   const needsSobSample = vocalizationSegments.some(
     segment => segment.cue === "sob"
+  );
+  const hasRenderableVocalization = vocalizationSegments.some(segment =>
+    segment.cue === "sob" ? hasSobSample : hasLaughSample
   );
 
   return {
@@ -80,10 +84,10 @@ export function analyzeExpressionScript(
     spokenText,
     hasSpeech: speechSegments.length > 0,
     hasVocalization: vocalizationSegments.length > 0,
-    needsLaughSample,
+    hasLaughCue,
     needsSobSample,
+    hasRenderableVocalization,
     missingSamples: [
-      ...(needsLaughSample && !hasLaughSample ? ["laugh/giggle"] : []),
       ...(needsSobSample && !hasSobSample ? ["cry/sob"] : []),
     ],
     vocalizationCount: vocalizationSegments.length,

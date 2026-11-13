@@ -65,7 +65,7 @@ namespace["gr"] = SimpleNamespace(
 namespace["DIFFUSION_STEPS"] = 50
 exec(compile(ast.Module(body=functions, type_ignores=[]), "backend-functions.py", "exec"), namespace, namespace)
 namespace["torch"] = SimpleNamespace(device=lambda value: value, float16="float16")
-namespace["PIPELINE_VERSION"] = "identity-anchored-v4-expressive-text-safe"
+namespace["PIPELINE_VERSION"] = "identity-anchored-v5-expressive-text-safe"
 namespace["DIFFUSION_STEPS"] = 50
 namespace["ACCENT_TO_SOURCE_SIMILARITY"] = 0.93
 namespace["BLENDED_PROMPT_SIMILARITY"] = 0.80
@@ -248,6 +248,31 @@ event_indices = np.where(np.isclose(event_output, 0.2))[0]
 assert event_indices.size > 0
 assert 22050 < event_indices[0] < event_output.size - 22050
 
+optional_laugh_model = Model()
+namespace["MODEL"] = optional_laugh_model
+optional_progress = []
+optional_laugh_result = namespace["_generate"](
+    "original-upload.wav", "accent-upload.wav",
+    "[mood:playful]First line. [laugh] [mood:sad]Second line.",
+    "valid", True, None, None,
+    progress=lambda value, desc: optional_progress.append((value, desc)),
+)
+assert optional_laugh_result.endswith(".wav")
+assert len(optional_laugh_model.calls) == 3
+assert any("Skipping the laugh cue" in desc for _, desc in optional_progress)
+optional_laugh_output = final_arrays[-1]
+assert not np.any(np.isclose(optional_laugh_output, 0.2)), "an absent laugh sample must not create audio"
+
+try:
+    namespace["_generate"](
+        "original-upload.wav", "accent-upload.wav", "[giggle]", "valid", True,
+        progress=lambda *args, **kwargs: None,
+    )
+except GrError as error:
+    assert "No spoken words remain after skipping optional" in str(error)
+else:
+    raise AssertionError("an event-only unsampled laugh must not return an empty WAV")
+
 try:
     namespace["_generate"](
         "original-upload.wav", "accent-upload.wav", "[sob]", "valid", True,
@@ -292,14 +317,14 @@ assert not any(name.startswith("accentlab_") for name in written_paths), "no fin
 # Authorized status carries the version; unauthorized status remains concealed.
 namespace["GPU_AVAILABLE"] = True
 namespace["MODEL"] = object()
-assert namespace["_status"]("valid")["pipeline_version"] == "identity-anchored-v4-expressive-text-safe"
+assert namespace["_status"]("valid")["pipeline_version"] == "identity-anchored-v5-expressive-text-safe"
 unauthorized = namespace["_status"]("wrong")
 assert "pipeline_version" not in unauthorized
 assert unauthorized.get("ready") is False
 assert unauthorized.get("gpu") is False
 assert unauthorized.get("sample_rate") == 22050
 assert unauthorized.get("message") == "Invalid access code."
-print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v4-expressive-text-safe"}))
+print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v5-expressive-text-safe"}))
 `;
 
 describe("identity-anchored backend fidelity", () => {

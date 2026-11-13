@@ -29,14 +29,29 @@ describe("expression cue parser", () => {
     ]);
   });
 
-  it("requires a laugh sample for laugh/giggle and a sob sample for sob", () => {
+  it("makes laugh/giggle samples optional but keeps sob samples required", () => {
     const missing = analyzeExpressionScript("[laugh][giggle][sob]");
     expect(missing.hasSpeech).toBe(false);
     expect(missing.hasVocalization).toBe(true);
-    expect(missing.missingSamples).toEqual(["laugh/giggle", "cry/sob"]);
+    expect(missing.hasLaughCue).toBe(true);
+    expect(missing.needsSobSample).toBe(true);
+    expect(missing.hasRenderableVocalization).toBe(false);
+    expect(missing.missingSamples).toEqual(["cry/sob"]);
 
-    const supplied = analyzeExpressionScript("[giggle][sob]", true, true);
-    expect(supplied.missingSamples).toEqual([]);
+    const laughSupplied = analyzeExpressionScript("[laugh][giggle]", true);
+    expect(laughSupplied.missingSamples).toEqual([]);
+    expect(laughSupplied.hasRenderableVocalization).toBe(true);
+
+    const sobSupplied = analyzeExpressionScript("[giggle][sob]", true, true);
+    expect(sobSupplied.missingSamples).toEqual([]);
+    expect(sobSupplied.hasRenderableVocalization).toBe(true);
+  });
+
+  it("does not consider a missing laugh sample playable for an event-only take", () => {
+    const skipped = analyzeExpressionScript("[giggle]");
+    expect(skipped.hasSpeech).toBe(false);
+    expect(skipped.hasRenderableVocalization).toBe(false);
+    expect(skipped.missingSamples).toEqual([]);
   });
 
   it("does not treat mood-only controls as spoken content", () => {
@@ -47,7 +62,9 @@ describe("expression cue parser", () => {
   });
 
   it("caps inserted non-speech events per generation", () => {
-    const cues = Array.from({ length: MAX_VOCALIZATION_CUES + 1 }, () => "[laugh]").join("");
+    const cues = Array.from({ length: MAX_VOCALIZATION_CUES + 1 }, () =>
+      "[laugh]"
+    ).join("");
     expect(analyzeExpressionScript(cues, true).tooManyVocalizations).toBe(true);
   });
 });

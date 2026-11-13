@@ -7,6 +7,7 @@ import {
   normalizeEndpoint,
   resultAudioUrl,
   safeError,
+  safeGenerationError,
   validateAudio,
 } from "../client/src/lib/colab";
 
@@ -105,6 +106,30 @@ describe("Colab URL and audio validation", () => {
     expect(
       safeError(new Error(`Bad code ${accessKey}`), accessKey)
     ).not.toContain(accessKey));
+  it("preserves the safe v5 upgrade instruction for an older worker", () => {
+    const message = safeError(
+      new Error(
+        "This Colab worker uses an older conversion pipeline. For manual connection, run the updated v5 notebook; for managed connection, start or reuse the current v5 backend. Then reconnect. No audio was uploaded."
+      ),
+      accessKey
+    );
+    expect(message).toContain("older conversion pipeline");
+    expect(message).toContain("updated v5 notebook");
+    expect(message).not.toContain(accessKey);
+  });
+  it("keeps genuine network failures sanitized", () => {
+    expect(safeError(new Error("Failed to fetch"), accessKey)).toContain(
+      "unreachable or has expired"
+    );
+  });
+  it("says a failed generation retry starts over without exposing the access code", () => {
+    const message = safeGenerationError(
+      new Error(`Network failed for ${accessKey}`),
+      accessKey
+    );
+    expect(message).toContain("starts from the beginning");
+    expect(message).not.toContain(accessKey);
+  });
 });
 
 describe("Colab connection", () => {
@@ -135,7 +160,12 @@ describe("Colab connection", () => {
     );
     expect(remote.close).toHaveBeenCalled();
   });
-  it.each([undefined, "two-stage-v1", "identity-anchored-v1"])(
+  it.each([
+    undefined,
+    "two-stage-v1",
+    "identity-anchored-v1",
+    "identity-anchored-v4-expressive-text-safe",
+  ])(
     "rejects an incompatible pipeline version %s before uploading",
     async pipelineVersion => {
       const remote = client({
@@ -168,7 +198,7 @@ describe("Colab connection", () => {
 });
 
 describe("Colab generation", () => {
-  it("uploads both references, forwards the seven-input v4 contract, reports progress, and returns audio", async () => {
+  it("uploads both references, forwards the seven-input v5 contract, reports progress, and returns audio", async () => {
     const job = submission([
       { type: "status", stage: "pending", position: 0 },
       {
@@ -246,13 +276,52 @@ describe("Colab generation", () => {
     ]);
     expect(mocks.handleFile).toHaveBeenCalledTimes(3);
   });
-  it("does not upload references or queue a vocal cue without its original-speaker sample", async () => {
+  it("allows speech with an unsampled laugh cue and skips its audio upload", async () => {
+    const job = submission([
+      {
+        type: "data",
+        data: [{ url: `${endpoint}/gradio_api/file=result.wav` }],
+      },
+    ]);
+    const remote = client({ submit: vi.fn().mockReturnValue(job) });
+    mocks.connect.mockResolvedValue(remote);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" }))
+      )
+    );
+    const connection = await ColabConnection.connect(endpoint, accessKey);
+    const value = { ...input(), script: "That was funny. [giggle]" };
+    await connection.generate(value, vi.fn());
+    expect(remote.submit).toHaveBeenCalledWith("/generate", [
+      { upload: value.sourceVoice },
+      { upload: value.accentReference },
+      value.script,
+      accessKey,
+      true,
+      null,
+      null,
+    ]);
+    expect(mocks.handleFile).toHaveBeenCalledTimes(2);
+  });
+  it("does not queue an event-only laugh cue without a usable audio sample", async () => {
     const remote = client();
     mocks.connect.mockResolvedValue(remote);
     const connection = await ColabConnection.connect(endpoint, accessKey);
     await expect(
       connection.generate({ ...input(), script: "[laugh]" }, vi.fn())
-    ).rejects.toThrow("Add the original speaker’s laugh/giggle sample");
+    ).rejects.toThrow("provide an original-speaker sample");
+    expect(remote.submit).not.toHaveBeenCalled();
+    expect(mocks.handleFile).not.toHaveBeenCalled();
+  });
+  it("still requires an original-speaker cry/sob sample for a sob cue", async () => {
+    const remote = client();
+    mocks.connect.mockResolvedValue(remote);
+    const connection = await ColabConnection.connect(endpoint, accessKey);
+    await expect(
+      connection.generate({ ...input(), script: "[sob]" }, vi.fn())
+    ).rejects.toThrow("cry/sob sample");
     expect(remote.submit).not.toHaveBeenCalled();
     expect(mocks.handleFile).not.toHaveBeenCalled();
   });

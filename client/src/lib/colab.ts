@@ -8,7 +8,7 @@ export const AUDIO_ACCEPT = ".wav,.mp3,.m4a,.ogg,.webm,.aac,.flac";
 export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 export const MAX_SCRIPT_LENGTH = 1200;
 export const REQUIRED_PIPELINE_VERSION =
-  "identity-anchored-v4-expressive-text-safe";
+  "identity-anchored-v5-expressive-text-safe";
 const CONNECT_TIMEOUT_MS = 45_000;
 const GENERATE_TIMEOUT_MS = 15 * 60_000;
 
@@ -86,13 +86,17 @@ export function safeError(error: unknown, accessKey = ""): string {
     ? raw.split(accessKey).join("[session code]")
     : raw;
   if (
-    /failed to fetch|networkerror|network request|load failed|404|502|503|connection|cors/i.test(
+    /failed to fetch|networkerror|network request|load failed|404|502|503|cors|failed to connect|unable to connect|cannot connect|connection (?:error|refused|reset|timed out|failed)|ETIMEDOUT|ECONNRESET|ECONNREFUSED/i.test(
       redacted
     )
   ) {
     return "The Colab session is unreachable or has expired. Keep Colab running, then reconnect using its current URL and session code.";
   }
   return redacted.slice(0, 350);
+}
+
+export function safeGenerationError(error: unknown, accessKey = ""): string {
+  return `${safeError(error, accessKey)} Partial takes are not saved; a new attempt starts from the beginning.`;
 }
 
 export function resultAudioUrl(value: unknown, endpoint: string): string {
@@ -146,7 +150,7 @@ function requireIdentityPipeline(value: unknown): asserts value is ColabStatus {
     value.pipeline_version !== REQUIRED_PIPELINE_VERSION
   ) {
     throw new Error(
-      "This notebook uses an older conversion pipeline. Download the updated AccentLab notebook, run it in a fresh free T4 session, and paste its new URL and access code."
+      "This Colab worker uses an older conversion pipeline. For manual connection, run the updated v5 notebook; for managed connection, start or reuse the current v5 backend. Then reconnect. No audio was uploaded."
     );
   }
   if (
@@ -275,17 +279,19 @@ export class ColabConnection {
       Boolean(input.laughSample),
       Boolean(input.sobSample)
     );
-    if (!expression.hasSpeech && !expression.hasVocalization)
-      throw new Error("Write spoken words or add a laugh, giggle, or sob cue.");
     if (expression.missingSamples.length)
       throw new Error(
         `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample before generating.`
+      );
+    if (!expression.hasSpeech && !expression.hasRenderableVocalization)
+      throw new Error(
+        "Write spoken words, or provide an original-speaker sample for a vocalization-only take."
       );
     if (expression.tooManyVocalizations)
       throw new Error(
         `Use no more than ${MAX_VOCALIZATION_CUES} laugh, giggle, or sob cues per take.`
       );
-    if (expression.needsLaughSample && input.laughSample)
+    if (expression.hasLaughCue && input.laughSample)
       validateAudio(input.laughSample);
     if (expression.needsSobSample && input.sobSample)
       validateAudio(input.sobSample);
@@ -325,7 +331,7 @@ export class ColabConnection {
       script,
       this.accessKey,
       true,
-      expression.needsLaughSample && input.laughSample
+      expression.hasLaughCue && input.laughSample
         ? handle_file(input.laughSample)
         : null,
       expression.needsSobSample && input.sobSample

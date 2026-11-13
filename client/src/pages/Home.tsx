@@ -20,6 +20,7 @@ import {
   ColabConnection,
   MAX_SCRIPT_LENGTH,
   safeError,
+  safeGenerationError,
   validateAudio,
   type GenerationProgress,
 } from "@/lib/colab";
@@ -96,14 +97,14 @@ function UploadCard({
     : isAccent
       ? "Accent reference"
       : kind === "laugh"
-        ? "Laugh / giggle sample"
-        : "Cry / sob sample";
+        ? "Laugh / giggle sample (optional)"
+        : "Cry / sob sample (required for [sob])";
   const uploadTitle = isSource
     ? "Original speaker"
     : isAccent
       ? "Target accent"
       : kind === "laugh"
-        ? "Original speaker’s laugh"
+        ? "Original speaker’s laugh (optional)"
         : "Original speaker’s sob";
   useEffect(() => {
     if (!file) {
@@ -139,7 +140,9 @@ function UploadCard({
           <span className="upload-subtitle">
             {kind === "source" || kind === "accent"
               ? "Clean 5–30 sec excerpt · up to 20 MB"
-              : "Clean 1–8 sec sound · up to 20 MB"}
+              : kind === "laugh"
+                ? "Optional · no clip means the cue is skipped · up to 20 MB"
+                : "Needed for [sob] · clean 1–8 sec sound · up to 20 MB"}
           </span>
         </button>
       ) : (
@@ -244,7 +247,7 @@ export default function Home() {
   const canGenerate = Boolean(
     sourceFile &&
       accentFile &&
-      (expression.hasSpeech || expression.hasVocalization) &&
+      (expression.hasSpeech || expression.hasRenderableVocalization) &&
       expression.missingSamples.length === 0 &&
       !expression.tooManyVocalizations &&
       consent &&
@@ -670,7 +673,7 @@ export default function Home() {
           accentReference: accentFile,
           script,
           consent,
-          laughSample: expression.needsLaughSample ? laughSample : null,
+          laughSample: expression.hasLaughCue ? laughSample : null,
           sobSample: expression.needsSobSample ? sobSample : null,
         },
         setProgress,
@@ -681,7 +684,7 @@ export default function Home() {
         setGenerationState("complete");
       }
     } catch (failure) {
-      setError(safeError(failure, accessKey));
+      setError(safeGenerationError(failure, accessKey));
       setGenerationState("error");
       // A failed GPU request must be rechecked before another upload.
       connectionRef.current?.close();
@@ -723,8 +726,9 @@ export default function Home() {
             </h1>
             <p className="intro-copy">
               Write the exact line, mark where its delivery should shift, and
-              add the original speaker’s laugh or sob where needed. AccentLab
-              keeps the experimental two-reference conversion on your free T4.
+              optionally add the original speaker’s laugh or giggle. A sob cue
+              needs a cry/sob clip. AccentLab keeps the experimental two-reference
+              conversion on your free T4.
             </p>
           </div>
           <div className="intro-note">
@@ -952,9 +956,13 @@ export default function Home() {
             </p>
           )}
           <p className="session-note">
-            Free Colab can disconnect. Keep it running and reconnect after a
-            restart. URL and access code stay only in this page’s memory; don’t
-            share them.
+            Free Colab may disconnect without warning. Google says managed free
+            runtimes may terminate web-UI content-generation jobs and lists
+            deepfakes as prohibited; voice conversion may be covered. Confirm
+            this use complies with the <a href="https://research.google.com/colaboratory/faq.html" target="_blank" rel="noreferrer">Colab FAQ</a>.
+            Interrupted takes are not saved; a retry starts the whole script
+            from the beginning. Reconnect before retrying. URL and access code
+            stay only in this page’s memory; don’t share them.
           </p>
         </section>
 
@@ -1080,7 +1088,10 @@ export default function Home() {
             <div className="expression-sample-panel">
               <div className="sample-panel-heading">
                 <span className="mini-label">Original-speaker vocal samples</span>
-                <p>Needed only for matching cues; only referenced clips upload.</p>
+                <p>
+                  Laugh/giggle clips are optional; without one, those cues are
+                  skipped. A [sob] cue needs a clip. Only matching event clips upload.
+                </p>
               </div>
               <div className="expression-samples">
                 <UploadCard
@@ -1111,8 +1122,12 @@ export default function Home() {
                 {expression.tooManyVocalizations
                   ? "Use no more than six laugh, giggle, or sob cues in one take."
                   : expression.missingSamples.length
-                    ? `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample to use those cues.`
-                    : "Mood shifts are approximate; laugh, giggle, and sob cues insert your supplied speaker sample."}
+                    ? `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample to use those cues.${expression.hasLaughCue && !laughSample ? " Laugh/giggle cues remain optional and will be skipped without their clip." : ""}`
+                    : expression.hasLaughCue && !laughSample && !expression.hasSpeech
+                      ? "A laugh clip is optional when speech is present; a laugh-only take needs the clip or spoken words."
+                      : expression.hasLaughCue && !laughSample
+                      ? "The laugh/giggle sample is optional. These cues will be skipped; no laugh sound is generated."
+                      : "Mood shifts are approximate. Supplied laugh/giggle clips are inserted; a [sob] cue requires its matching clip."}
               </p>
             </div>
             <div className="script-preview-row">
@@ -1175,9 +1190,9 @@ export default function Home() {
                   <p className="output-caveat">
                     Pronunciation Guard checks every requested word locally after conversion.
                     Mood cues use small pitch/rate shifts and may sound subtle.
-                    Laugh/giggle/sob cues insert your uploaded original-speaker
-                    sample. No numeric speaker-likeness score is guaranteed.
-                    Keep this page and Colab open.
+                    Supplied event clips are inserted; laugh/giggle cues without
+                    an optional clip are skipped. Free Colab may disconnect; this
+                    take cannot resume mid-script, and retrying starts from the beginning.
                   </p>
                 </div>
               ) : generationState === "complete" && outputUrl ? (
@@ -1202,7 +1217,10 @@ export default function Home() {
                   </a>
                   <p className="output-caveat">
                     Compare this take with both references. Mood delivery is
-                    approximate; vocal moments are the supplied speaker sample.
+                    approximate; supplied vocal moments are speaker clips.
+                    {expression.hasLaughCue && !laughSample
+                      ? " Laugh/giggle cues without a clip were skipped."
+                      : ""}
                     Identity, naturalness, accent, and an 85–95% likeness are
                     not guaranteed.
                   </p>
@@ -1278,14 +1296,16 @@ export default function Home() {
             <strong>
               An experimental voice-conversion tool, not a perfect voice clone.
             </strong>{" "}
-            The current identity-anchored v3 text-safe baseline uses two passes,
-            chunks speech, and verifies spoken words before returning audio.
+            The current identity-anchored v5 expressive pipeline retains the
+            v3 two-pass text-safe baseline, chunks speech, and verifies spoken
+            words before returning audio.
             The original recording guides identity and the accent reference
             guides accent/style; the model does not perfectly separate them.
             Mood cues only apply small supported pitch/rate changes, so their
-            effect is approximate. Laugh, giggle, and sob cues insert the
-            original speaker’s supplied event sample; AccentLab does not claim
-            to synthesize those sounds. Write your own joke and mark its
+            effect is approximate. A laugh/giggle clip is optional; without one,
+            those cues are skipped. A sob cue requires the original speaker’s
+            supplied cry/sob clip. AccentLab does not claim to synthesize those
+            sounds. Write your own joke and mark its
             delivery—jokes are not generated or detected automatically. No
             85–95% speaker-similarity guarantee is available. Microsoft’s Edge
             speech service receives the script to make a temporary scaffold;

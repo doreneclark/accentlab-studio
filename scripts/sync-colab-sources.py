@@ -22,17 +22,17 @@ BOOTSTRAP_PATH = ROOT / "server/colab-bootstrap.ts"
 BACKEND_PATH = ROOT / "colab/accentlab_seedvc_backend.py"
 NOTEBOOK_GUIDANCE = """# AccentLab Studio — expressive text-safe voice conversion
 
-This is an experimental, temporary backend for the AccentLab Studio two-reference workflow. It uses the pinned Seed-VC upstream v2 model on a free Colab T4. The application pipeline is currently `identity-anchored-v4-expressive-text-safe`: it preserves the existing v3 two-pass, chunked, text-verified baseline and adds explicit expression cues. The old “v2 trial” label in historical notes referred to an unverified three-pass AccentLab experiment, not the upstream model version. Do not treat any setting or version name as an 85–95% similarity score.
+This is an experimental, temporary backend for the AccentLab Studio two-reference workflow. It uses the pinned Seed-VC upstream v2 model on a free Colab T4. The application pipeline is currently `identity-anchored-v5-expressive-text-safe`: it preserves the existing v3 two-pass, chunked, text-verified baseline and v4 expression cues, and makes laugh/giggle samples optional. The old “v2 trial” label in historical notes referred to an unverified three-pass AccentLab experiment, not the upstream model version. Do not treat any setting or version name as an 85–95% similarity score.
 
 Write the exact spoken words, then place cues where you want a delivery change. `[mood:neutral]`, `[mood:playful]`, `[mood:excited]`, `[mood:sad]`, and `[mood:calm]` set the mood for following speech until the next mood cue. These use small Edge-TTS pitch/rate adjustments on a temporary scaffold; they are approximate, not named-emotion synthesis. Write your own jokes; the system does not create jokes or guess when a line should be funny.
 
-`[laugh]` and `[giggle]` insert the supplied short laugh/giggle clip from the original speaker. `[sob]` inserts that speaker's supplied cry/sob clip. The event clip itself is reused, not generated or claimed as a new clone. A cue requires its matching clip. Use only files for which the speaker has given permission. Event samples are capped to eight seconds, and the spoken words—not those non-verbal clips—are checked by Pronunciation Guard.
+`[laugh]` and `[giggle]` insert the supplied short laugh/giggle clip from the original speaker when provided; the sample is optional, and a cue is skipped if no clip is supplied. `[sob]` requires that speaker's supplied cry/sob clip. Event clips are reused, not generated or claimed as new cloned sounds. Use only files for which the speaker has given permission. Event samples are capped to eight seconds, and the spoken words—not those non-verbal clips—are checked by Pronunciation Guard.
 
 The `/status` response includes the required pipeline version. `/generate` takes seven inputs in order: original voice filepath, French-accent reference filepath, script with cues (maximum 1,200 characters), access code, permission confirmation, optional laugh/giggle filepath, and optional cry/sob filepath. Unused optional samples should be `None`. Older notebooks are rejected by the website until updated.
 
 In Colab, select **Runtime → Change runtime type → T4 GPU**. Run only the installation cell. After it completes, restart the session once to load the compatible packages. Reconnect to T4, run the GPU/import check, then run the backend launch cell. Do not run all cells before completing the restart. Keep the temporary share URL and random access code private. The share URL is public to anyone who obtains it while the runtime is alive.
 
-References, the event samples used by cues, and generated files are processed through Gradio in the temporary Colab runtime. The script is also sent to Microsoft Edge-TTS to create the temporary scaffold. Do not use sensitive material. Identity, accent, naturalness and likeness are not guaranteed; a real-speaker listening comparison has not been completed.
+References, the event samples used by cues, and generated files are processed through Gradio in the temporary Colab runtime. The script is also sent to Microsoft Edge-TTS to create the temporary scaffold. A runtime/job disconnect loses this in-memory take; the app cannot resume at a prior chunk, and retrying starts from the beginning. Free Colab may terminate web-UI content-generation workloads; do not add keepalive or auto-restart workarounds. Do not use sensitive material. Identity, accent, naturalness and likeness are not guaranteed; a real-speaker listening comparison has not been completed.
 """
 
 
@@ -114,7 +114,7 @@ def build_artifacts() -> dict[Path, str]:
     code_cells[2]["source"] = backend_cell_text.splitlines(keepends=True)
     if notebook.get("metadata", {}).get("colab") is not None:
         notebook["metadata"]["colab"]["name"] = (
-            "AccentLab Studio — v4 expressive text-safe pipeline"
+            "AccentLab Studio — v5 expressive text-safe pipeline"
         )
 
     worker = WORKER_PATH.read_text(encoding="utf-8")
