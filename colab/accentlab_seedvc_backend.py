@@ -1,7 +1,7 @@
 """AccentLab experimental two-reference Seed-VC v5 expressive backend.
 
-This module runs from a pinned checkout of the official Seed-VC repository in a
-free Google Colab T4 runtime. It is an experimental approximation, not a model-
+This module runs from a pinned checkout of the official Seed-VC repository in
+Google Colab or the optional Hugging Face T4-small Space. It is an experimental approximation, not a model-
 level disentangler of speaker identity and accent, and does not promise an
 identity, naturalness, or accent improvement.
 
@@ -12,8 +12,9 @@ The public Gradio API is intentionally small and stable:
 * ``/generate``: source/accent references, tagged script, access code, consent,
   and optional original-speaker laugh/giggle and sob samples -> an audio filepath.
 
-The access key is generated at process launch and is never stored in this
-source file. The caller must supply it for both endpoints.
+Colab creates a random access key at process launch; the hosted Space reads its
+separate protected application key from an environment secret. Neither key is
+stored in this source file. The caller must supply it for both API endpoints.
 """
 
 from __future__ import annotations
@@ -72,15 +73,33 @@ MOOD_PROSODY = {
     "sad": {"rate": "-7%", "pitch": "-2Hz"},
     "calm": {"rate": "-4%", "pitch": "-1Hz"},
 }
-OUTPUT_RETENTION_SECONDS = 60 * 60
-OUTPUT_DIR = Path(tempfile.gettempdir()) / "accentlab_outputs"
+HOSTED_SPACE = os.environ.get("ACCENTLAB_HF_SPACE") == "1"
+OUTPUT_RETENTION_SECONDS = 5 * 60 if HOSTED_SPACE else 60 * 60
+OUTPUT_DIR = Path(
+    os.environ.get(
+        "ACCENTLAB_OUTPUT_DIR",
+        str(Path(tempfile.gettempdir()) / "accentlab_outputs"),
+    )
+)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# The generated value is printed once at launch for the notebook owner. It is
-# intentionally not a constant in the notebook or repository.
-ACCESS_KEY = secrets.token_urlsafe(18)
+# The HF Space uses a separate, protected application key shared with the
+# AccentLab server. It is never sent to Hugging Face management APIs or logged.
+# Colab keeps its existing one-time random key behavior and printed handoff.
+ACCESS_KEY = (
+    os.environ.get("ACCENTLAB_ACCESS_KEY", "").strip()
+    if HOSTED_SPACE
+    else secrets.token_urlsafe(18)
+)
+if HOSTED_SPACE and len(ACCESS_KEY) < 32:
+    raise RuntimeError(
+        "ACCENTLAB_ACCESS_KEY must be configured as a protected Space secret of at least 32 characters."
+    )
 ACCESS_KEY_DIGEST = hashlib.sha256(ACCESS_KEY.encode("utf-8")).digest()
-print(f"AccentLab access code (keep private): {ACCESS_KEY}")
+if HOSTED_SPACE:
+    print("AccentLab Space access key is configured; value withheld.")
+else:
+    print(f"AccentLab access code (keep private): {ACCESS_KEY}")
 print(f"Seed-VC source pin: {SEED_VC_COMMIT}")
 print(f"AccentLab pipeline: {PIPELINE_VERSION}")
 
@@ -128,7 +147,11 @@ def _load_v2_model() -> Any:
     if MODEL is not None:
         return MODEL
     if not GPU_AVAILABLE:
-        raise RuntimeError("A CUDA GPU is required; select a free Colab T4 runtime.")
+        raise RuntimeError(
+            "A CUDA GPU is required; configure a Hugging Face T4-small runtime."
+            if HOSTED_SPACE
+            else "A CUDA GPU is required; select a free Colab T4 runtime."
+        )
 
     _seed_vc_import_path()
     from hydra.utils import instantiate
@@ -155,7 +178,11 @@ def initialize_runtime() -> None:
     """Preload the model so /status can report truthful readiness."""
     global MODEL_ERROR
     if not GPU_AVAILABLE:
-        MODEL_ERROR = "CUDA GPU unavailable; choose Runtime > Change runtime type > T4 GPU."
+        MODEL_ERROR = (
+            "CUDA GPU unavailable; configure a Hugging Face T4-small runtime."
+            if HOSTED_SPACE
+            else "CUDA GPU unavailable; choose Runtime > Change runtime type > T4 GPU."
+        )
         print(f"AccentLab not ready: {MODEL_ERROR}")
         return
     try:
@@ -182,7 +209,11 @@ def _status(access_key: str) -> dict[str, Any]:
             "gpu": False,
             "sample_rate": SAMPLE_RATE,
             "pipeline_version": PIPELINE_VERSION,
-            "message": "CUDA GPU unavailable; select a free Colab T4 runtime.",
+            "message": (
+                "CUDA GPU unavailable; configure a Hugging Face T4-small runtime."
+                if HOSTED_SPACE
+                else "CUDA GPU unavailable; select a free Colab T4 runtime."
+            ),
         }
     if MODEL is None:
         return {
@@ -584,7 +615,16 @@ def _cleanup_old_outputs() -> None:
             continue
 
 
-def _generate(
+def _cleanup_hosted_outputs() -> None:
+    """Remove expired hosted outputs even when no later generation arrives."""
+    if not HOSTED_SPACE:
+        return
+    while True:
+        _cleanup_old_outputs()
+        time.sleep(60)
+
+
+def _generate_impl(
     source_voice: str,
     accent_reference: str,
     script: str,
@@ -806,9 +846,58 @@ def _generate(
         GENERATION_LOCK.release()
 
 
+def _remove_hosted_uploads(paths: Iterable[str | None]) -> None:
+    """Delete Gradio input uploads from the ephemeral Space temp folder."""
+    if not HOSTED_SPACE:
+        return
+    upload_root = Path(
+        os.environ.get("GRADIO_TEMP_DIR", str(Path(tempfile.gettempdir()) / "gradio"))
+    ).resolve()
+    for raw_path in paths:
+        if not raw_path or not isinstance(raw_path, str):
+            continue
+        try:
+            candidate = Path(raw_path).resolve(strict=True)
+            if candidate.is_file() and candidate.is_relative_to(upload_root):
+                candidate.unlink()
+        except (FileNotFoundError, OSError, RuntimeError):
+            continue
+
+
+def _generate(
+    source_voice: str,
+    accent_reference: str,
+    script: str,
+    access_key: str,
+    consent: bool,
+    laugh_sample: str | None = None,
+    sob_sample: str | None = None,
+    progress=gr.Progress(),
+) -> str:
+    """Scrub hosted input uploads after the unchanged v5 pipeline returns."""
+    try:
+        return _generate_impl(
+            source_voice,
+            accent_reference,
+            script,
+            access_key,
+            consent,
+            laugh_sample,
+            sob_sample,
+            progress,
+        )
+    finally:
+        _remove_hosted_uploads(
+            [source_voice, accent_reference, laugh_sample, sob_sample]
+        )
+
+
 def build_demo() -> gr.Blocks:
     """Build Blocks with the exact v4 /status and /generate API contracts."""
-    with gr.Blocks(title="AccentLab Studio — expressive text-safe") as demo:
+    block_options = {"delete_cache": (60, OUTPUT_RETENTION_SECONDS)} if HOSTED_SPACE else {}
+    with gr.Blocks(
+        title="AccentLab Studio — expressive text-safe", **block_options
+    ) as demo:
         gr.Markdown(
             "## AccentLab Studio — expressive text-safe conversion\n"
             "Use only recordings you have permission to transform. Mood cues use "
@@ -874,5 +963,16 @@ def build_demo() -> gr.Blocks:
 initialize_runtime()
 demo = build_demo()
 demo.queue(default_concurrency_limit=1)
-print("Starting temporary Gradio URL; keep this Colab tab open while using it.")
-demo.launch(share=True, debug=True, max_file_size="20mb")
+if HOSTED_SPACE:
+    threading.Thread(target=_cleanup_hosted_outputs, daemon=True).start()
+    print("Starting the Hugging Face Space Gradio app; access key withheld.")
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("SPACE_PORT", "7860")),
+        share=False,
+        debug=False,
+        max_file_size="20mb",
+    )
+else:
+    print("Starting temporary Gradio URL; keep this Colab tab open while using it.")
+    demo.launch(share=True, debug=True, max_file_size="20mb")

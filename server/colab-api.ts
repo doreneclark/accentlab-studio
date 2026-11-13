@@ -17,6 +17,7 @@ import {
   buildBootstrapStartCode,
   buildBootstrapStatusCode,
 } from "./colab-bootstrap";
+import { HUGGINGFACE_STATE_COOKIE } from "./huggingface-api";
 
 export const COLAB_PUBLIC_ORIGIN = "https://accentlab2-ii4q5q9z.manus.space";
 export const COLAB_CALLBACK_PATH = "/api/colab/oauth/callback";
@@ -333,7 +334,8 @@ function requestOrigin(req: Request): string {
     (typeof req.headers.host === "string" && req.headers.host.trim());
   if (!host) return COLAB_PUBLIC_ORIGIN;
   const protocol =
-    (typeof forwardedProto === "string" && forwardedProto.split(",")[0].trim()) ||
+    (typeof forwardedProto === "string" &&
+      forwardedProto.split(",")[0].trim()) ||
     (req.protocol === "http" ? "http" : "https");
   return `${protocol}://${host}`;
 }
@@ -1064,93 +1066,100 @@ export function registerColabApiRoutes(
     );
   });
 
-  app.get(COLAB_CALLBACK_PATH, async (req: Request, res: ExpressResponse) => {
-    res.set("Cache-Control", "no-store");
-    const stateCookie = readCookie(req, COLAB_STATE_COOKIE);
-    clearCookie(res, COLAB_STATE_COOKIE, allowInsecureCookies);
-    if (configurationError) {
-      res.redirect(302, "/?colab_auth=error");
-      return;
-    }
-    const statePayload = open<OAuthStatePayload>(stateCookie, clientSecret);
-    const state = getQuery(req, "state");
-    const code = getQuery(req, "code");
-    if (
-      !statePayload ||
-      statePayload.v !== 1 ||
-      statePayload.exp <= nowSeconds(now) ||
-      !safeString(statePayload.runtimeKey, 128) ||
-      !state ||
-      state !== statePayload.state ||
-      !code ||
-      code.length > 4096
-    ) {
-      res.redirect(302, "/?colab_auth=error");
-      return;
-    }
-    try {
-      const callbackUrl = `${requestOrigin(req)}${COLAB_CALLBACK_PATH}`;
-      const token = await httpJson(
-        fetcher,
-        "https://oauth2.googleapis.com/token",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            Accept: "application/json",
-          },
-          body: new URLSearchParams({
-            code,
-            client_id: clientId,
-            client_secret: clientSecret,
-            redirect_uri: callbackUrl,
-            grant_type: "authorization_code",
-            code_verifier: statePayload.verifier,
-          }).toString(),
-        },
-        "OAuth token"
-      );
-      const accessToken =
-        token && typeof token === "object"
-          ? safeString((token as Record<string, unknown>).access_token, 4096)
-          : undefined;
-      const expiresIn =
-        token &&
-        typeof token === "object" &&
-        typeof (token as Record<string, unknown>).expires_in === "number"
-          ? ((token as Record<string, unknown>).expires_in as number)
-          : 0;
-      if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 30)
-        throw new Error("invalid token");
-      const sid = base64url(randomBytes(24));
-      const csrfToken = base64url(randomBytes(24));
-      const exp = nowSeconds(now) + Math.max(30, Math.floor(expiresIn) - 30);
-      const maxAge = Math.max(1000, (exp - nowSeconds(now)) * 1000);
-      setCookie(
-        res,
-        COLAB_SESSION_COOKIE,
-        seal(
-          {
-            v: 1,
-            sid,
-            runtimeKey: statePayload.runtimeKey,
-            csrfToken,
-            accessToken,
-            exp,
-          } satisfies SessionPayload,
-          clientSecret
-        ),
-        allowInsecureCookies,
-        maxAge
-      );
-      res.redirect(302, "/?colab_auth=success");
-    } catch (error) {
-      if (error instanceof ColabHttpError && error.status === 401) {
-        /* do not expose provider response */
+  app.get(
+    COLAB_CALLBACK_PATH,
+    async (req: Request, res: ExpressResponse, next: NextFunction) => {
+      if (readCookie(req, HUGGINGFACE_STATE_COOKIE)) {
+        next();
+        return;
       }
-      res.redirect(302, "/?colab_auth=error");
+      res.set("Cache-Control", "no-store");
+      const stateCookie = readCookie(req, COLAB_STATE_COOKIE);
+      clearCookie(res, COLAB_STATE_COOKIE, allowInsecureCookies);
+      if (configurationError) {
+        res.redirect(302, "/?colab_auth=error");
+        return;
+      }
+      const statePayload = open<OAuthStatePayload>(stateCookie, clientSecret);
+      const state = getQuery(req, "state");
+      const code = getQuery(req, "code");
+      if (
+        !statePayload ||
+        statePayload.v !== 1 ||
+        statePayload.exp <= nowSeconds(now) ||
+        !safeString(statePayload.runtimeKey, 128) ||
+        !state ||
+        state !== statePayload.state ||
+        !code ||
+        code.length > 4096
+      ) {
+        res.redirect(302, "/?colab_auth=error");
+        return;
+      }
+      try {
+        const callbackUrl = `${requestOrigin(req)}${COLAB_CALLBACK_PATH}`;
+        const token = await httpJson(
+          fetcher,
+          "https://oauth2.googleapis.com/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              Accept: "application/json",
+            },
+            body: new URLSearchParams({
+              code,
+              client_id: clientId,
+              client_secret: clientSecret,
+              redirect_uri: callbackUrl,
+              grant_type: "authorization_code",
+              code_verifier: statePayload.verifier,
+            }).toString(),
+          },
+          "OAuth token"
+        );
+        const accessToken =
+          token && typeof token === "object"
+            ? safeString((token as Record<string, unknown>).access_token, 4096)
+            : undefined;
+        const expiresIn =
+          token &&
+          typeof token === "object" &&
+          typeof (token as Record<string, unknown>).expires_in === "number"
+            ? ((token as Record<string, unknown>).expires_in as number)
+            : 0;
+        if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 30)
+          throw new Error("invalid token");
+        const sid = base64url(randomBytes(24));
+        const csrfToken = base64url(randomBytes(24));
+        const exp = nowSeconds(now) + Math.max(30, Math.floor(expiresIn) - 30);
+        const maxAge = Math.max(1000, (exp - nowSeconds(now)) * 1000);
+        setCookie(
+          res,
+          COLAB_SESSION_COOKIE,
+          seal(
+            {
+              v: 1,
+              sid,
+              runtimeKey: statePayload.runtimeKey,
+              csrfToken,
+              accessToken,
+              exp,
+            } satisfies SessionPayload,
+            clientSecret
+          ),
+          allowInsecureCookies,
+          maxAge
+        );
+        res.redirect(302, "/?colab_auth=success");
+      } catch (error) {
+        if (error instanceof ColabHttpError && error.status === 401) {
+          /* do not expose provider response */
+        }
+        res.redirect(302, "/?colab_auth=error");
+      }
     }
-  });
+  );
 
   app.post(
     "/api/colab/launch",

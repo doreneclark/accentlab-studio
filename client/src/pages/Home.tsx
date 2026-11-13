@@ -33,15 +33,42 @@ import {
 import { analyzeExpressionScript } from "@/lib/expression-cues";
 
 type RecordingKind = "source" | "accent" | "laugh" | "sob";
+type Provider = "colab" | "huggingface";
 type GenerationState = "idle" | "generating" | "complete" | "error";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type ManagedStage = "idle" | "installing" | "loading" | "ready" | "error";
+type HuggingFaceStage =
+  | "paused"
+  | "starting"
+  | "ready"
+  | "generating"
+  | "pausing"
+  | "error";
 
 interface ColabSessionResponse {
   configured: boolean;
   authorized: boolean;
   csrfToken?: string;
   message?: string;
+}
+
+interface HuggingFaceSessionResponse {
+  configured: boolean;
+  authorized: boolean;
+  csrfToken?: string;
+  stage?: "paused" | "starting" | "ready" | "error";
+  hardware?: string | null;
+  t4Small?: boolean;
+  generationActive?: boolean;
+  generationLeaseExpired?: boolean;
+  generationId?: string;
+  pausePending?: boolean;
+  generationLeaseExpiresAt?: number;
+  priceUsdPerHour?: number;
+  spaceUrl?: string;
+  accessKey?: string;
+  message?: string;
+  error?: string;
 }
 
 interface ColabLaunchResponse {
@@ -54,6 +81,7 @@ interface ColabLaunchResponse {
 
 const COLAB_POLL_INTERVAL_MS = 8_000;
 const COLAB_MAX_POLL_MS = 30 * 60 * 1_000;
+const HUGGINGFACE_POLL_INTERVAL_MS = 8_000;
 
 function formatBytes(bytes: number) {
   return bytes < 1024 * 1024
@@ -201,6 +229,7 @@ function UploadCard({
 }
 
 export default function Home() {
+  const [provider, setProvider] = useState<Provider>("colab");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [accentFile, setAccentFile] = useState<File | null>(null);
   const [laughSample, setLaughSample] = useState<File | null>(null);
@@ -219,6 +248,21 @@ export default function Home() {
   const [colabSessionMessage, setColabSessionMessage] = useState("");
   const [colabAuthNotice, setColabAuthNotice] = useState("");
   const [colabAuthNoticeIsError, setColabAuthNoticeIsError] = useState(false);
+  const [hfConfigured, setHfConfigured] = useState<boolean | null>(null);
+  const [hfAuthorized, setHfAuthorized] = useState(false);
+  const [hfSessionLoading, setHfSessionLoading] = useState(true);
+  const [hfAuthNotice, setHfAuthNotice] = useState("");
+  const [hfCsrfToken, setHfCsrfToken] = useState("");
+  const [hfStage, setHfStage] = useState<HuggingFaceStage>("paused");
+  const [hfRuntimeRunning, setHfRuntimeRunning] = useState(false);
+  const [hfHardwareConfirmed, setHfHardwareConfirmed] = useState(false);
+  const [hfMessage, setHfMessage] = useState("");
+  const [hfPrice, setHfPrice] = useState(0.4);
+  const [hfSpaceUrl, setHfSpaceUrl] = useState("");
+  const [hfAccessKey, setHfAccessKey] = useState("");
+  const [hfGenerationActive, setHfGenerationActive] = useState(false);
+  const [hfLeaseExpired, setHfLeaseExpired] = useState(false);
+  const [hfLeaseId, setHfLeaseId] = useState("");
   const [managedStage, setManagedStage] = useState<ManagedStage>("idle");
   const [managedMessage, setManagedMessage] = useState("");
   const [sampleRate, setSampleRate] = useState<number | null>(null);
@@ -237,11 +281,14 @@ export default function Home() {
   const managedPollToken = useRef("");
   const managedPollDeadline = useRef(0);
   const managedVerifyAttempt = useRef(0);
+  const hfStatusInFlight = useRef(false);
+  const hfConnectInFlight = useRef(false);
   const mountedRef = useRef(true);
   const busy = generationState === "generating";
   const hasScript = Boolean(script.trim());
   const expression = useMemo(
-    () => analyzeExpressionScript(script, Boolean(laughSample), Boolean(sobSample)),
+    () =>
+      analyzeExpressionScript(script, Boolean(laughSample), Boolean(sobSample)),
     [script, laughSample, sobSample]
   );
   const canGenerate = Boolean(
@@ -283,6 +330,7 @@ export default function Home() {
     let cancelled = false;
     const query = new URLSearchParams(window.location.search);
     const authResult = query.get("colab_auth");
+    const hfAuthResult = query.get("hf_auth");
     if (authResult) {
       query.delete("colab_auth");
       const nextQuery = query.toString();
@@ -298,6 +346,20 @@ export default function Home() {
           : "Google authorization did not complete. You can still use the manual Colab URL and access-code connection below."
       );
       setColabAuthNoticeIsError(!succeeded);
+    }
+    if (hfAuthResult) {
+      query.delete("hf_auth");
+      const nextQuery = query.toString();
+      window.history.replaceState(
+        window.history.state,
+        document.title,
+        `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${window.location.hash}`
+      );
+      setHfAuthNotice(
+        hfAuthResult === "success"
+          ? "Google identity verified. Hugging Face controls are available only if this is the allowlisted account."
+          : "Google identity verification did not complete. Hugging Face controls remain unavailable."
+      );
     }
 
     const loadSession = async () => {
@@ -413,7 +475,8 @@ export default function Home() {
 
   const connectWithCredentials = async (
     rawEndpoint: string,
-    rawAccessKey: string
+    rawAccessKey: string,
+    selectedProvider: "Colab" | "Hugging Face" = "Colab"
   ): Promise<boolean> => {
     if (busy) return false;
     disconnect();
@@ -423,7 +486,8 @@ export default function Home() {
     try {
       const connection = await ColabConnection.connect(
         rawEndpoint,
-        rawAccessKey
+        rawAccessKey,
+        selectedProvider
       );
       if (attempt !== connectionAttempt.current) {
         connection.close();
@@ -437,10 +501,137 @@ export default function Home() {
     } catch (failure) {
       if (attempt !== connectionAttempt.current) return false;
       setConnectionState("disconnected");
-      setConnectionError(safeError(failure, rawAccessKey));
+      setConnectionError(safeError(failure, rawAccessKey, selectedProvider));
       return false;
     }
   };
+
+  const refreshHuggingFaceSession = async (checkInference = false) => {
+    if (hfStatusInFlight.current) return;
+    hfStatusInFlight.current = true;
+    try {
+      const response = await fetch("/api/huggingface/session", {
+        credentials: "include",
+        cache: "no-store",
+      });
+      const body = (await response
+        .json()
+        .catch(() => ({}))) as HuggingFaceSessionResponse;
+      if (!response.ok)
+        throw new Error(body.error || "Could not check Hugging Face status.");
+      setHfAuthNotice("");
+      setHfConfigured(body.configured);
+      setHfAuthorized(body.authorized);
+      setHfCsrfToken(body.csrfToken || "");
+      setHfPrice(
+        typeof body.priceUsdPerHour === "number" ? body.priceUsdPerHour : 0.4
+      );
+      setHfGenerationActive(body.generationActive === true);
+      setHfLeaseExpired(body.generationLeaseExpired === true);
+      setHfLeaseId(body.generationId || "");
+      setHfHardwareConfirmed(body.t4Small === true);
+      setHfRuntimeRunning(
+        (body.stage === "ready" || body.stage === "starting") &&
+          body.t4Small === true
+      );
+      setHfSpaceUrl(body.authorized ? body.spaceUrl || "" : "");
+      setHfAccessKey(body.authorized ? body.accessKey || "" : "");
+      setHfMessage(
+        body.pausePending
+          ? "Pause is pending; new generations remain blocked until Hugging Face confirms the Space is paused."
+          : body.stage === "ready" && body.t4Small !== true
+            ? "Space is running on hardware other than T4-small. AccentLab will not connect, start, change, or pause it; check the Hugging Face Space settings."
+            : body.message || ""
+      );
+      const nextStage: HuggingFaceStage = body.generationActive
+        ? "generating"
+        : body.pausePending
+          ? "pausing"
+          : body.stage === "ready" && body.t4Small !== true
+            ? "error"
+            : body.stage || (body.configured ? "error" : "paused");
+      setHfStage(nextStage);
+      if (
+        checkInference &&
+        provider === "huggingface" &&
+        body.authorized &&
+        body.stage === "ready" &&
+        body.t4Small === true &&
+        !body.pausePending &&
+        !body.generationActive &&
+        body.spaceUrl &&
+        body.accessKey &&
+        connectionState !== "connected" &&
+        connectionState !== "connecting" &&
+        !busy &&
+        !hfConnectInFlight.current
+      ) {
+        hfConnectInFlight.current = true;
+        const connected = await connectWithCredentials(
+          body.spaceUrl,
+          body.accessKey,
+          "Hugging Face"
+        );
+        if (connected) {
+          setHfStage("ready");
+          setHfMessage("v5 inference health check passed. T4-small is ready.");
+        } else {
+          setHfStage("starting");
+          setHfMessage(
+            "Space is running; waiting for v5 inference to finish loading."
+          );
+        }
+      }
+    } catch (failure) {
+      setHfRuntimeRunning(false);
+      setHfHardwareConfirmed(false);
+      setHfLeaseExpired(false);
+      setHfLeaseId("");
+      setHfStage("error");
+      setHfAuthNotice(
+        failure instanceof Error
+          ? failure.message
+          : "Hugging Face controls could not verify their safety state."
+      );
+      setHfMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Could not check Hugging Face status."
+      );
+    } finally {
+      hfStatusInFlight.current = false;
+      hfConnectInFlight.current = false;
+      setHfSessionLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (cancelled) return;
+      await refreshHuggingFaceSession(false);
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      provider !== "huggingface" ||
+      !hfAuthorized ||
+      (hfStage !== "starting" &&
+        hfStage !== "ready" &&
+        hfStage !== "pausing" &&
+        !hfGenerationActive)
+    )
+      return;
+    const timer = setInterval(() => {
+      void refreshHuggingFaceSession(true);
+    }, HUGGINGFACE_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [provider, hfAuthorized, hfStage, hfGenerationActive, connectionState]);
 
   const handleConnect = async () => {
     if (connectionState === "connecting" || busy) return;
@@ -659,6 +850,129 @@ export default function Home() {
     }
   };
 
+  const postHuggingFace = async <T,>(
+    path: string,
+    body: unknown = {}
+  ): Promise<T> => {
+    const response = await fetch(`/api/huggingface/${path}`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "X-AccentLab-HF-CSRF": hfCsrfToken,
+      },
+      body: JSON.stringify(body),
+    });
+    const result = (await response.json().catch(() => ({}))) as T & {
+      error?: string;
+    };
+    if (!response.ok)
+      throw new Error(result.error || "Hugging Face request failed.");
+    return result;
+  };
+
+  const handleProviderChange = (next: Provider) => {
+    if (busy || next === provider) return;
+    disconnect();
+    setEndpoint("");
+    setAccessKey("");
+    resetOutput();
+    setProvider(next);
+    if (next === "huggingface") void refreshHuggingFaceSession(false);
+  };
+
+  const handleStartHuggingFace = async () => {
+    if (
+      !hfAuthorized ||
+      !hfCsrfToken ||
+      !hfHardwareConfirmed ||
+      hfStage !== "paused" ||
+      busy
+    )
+      return;
+    const confirmed = window.confirm(
+      `Start the Hugging Face T4-small Space?\n\nPrice: $${hfPrice.toFixed(2)} per running hour, billed by the minute. Charges continue while it is starting or running. Pause the Hugging Face worker when finished; this does not pause Colab or the website. No different hardware will be selected by AccentLab. Start now?`
+    );
+    if (!confirmed) return;
+    setHfStage("starting");
+    setHfMessage("Sending the confirmed start request to Hugging Face…");
+    try {
+      const result = await postHuggingFace<{
+        stage: "starting";
+        message: string;
+      }>("start", { confirmation: "HF_T4_SMALL_040_PER_HOUR" });
+      setHfMessage(result.message);
+      await refreshHuggingFaceSession(false);
+    } catch (failure) {
+      setHfStage("error");
+      setHfMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Could not start the Hugging Face Space."
+      );
+    }
+  };
+
+  const handlePauseHuggingFace = async () => {
+    if (!hfAuthorized || !hfCsrfToken || hfGenerationActive || busy) return;
+    const confirmed = window.confirm(
+      "Pause the Hugging Face worker? This stops only the Hugging Face Space; it does not pause Colab or the website. The Space can be deliberately started again later."
+    );
+    if (!confirmed) return;
+    setHfStage("pausing");
+    setHfMessage("Requesting pause for the Hugging Face worker…");
+    try {
+      const result = await postHuggingFace<{
+        stage: "paused" | "pausing";
+        message: string;
+      }>("pause");
+      if (result.stage === "paused") {
+        disconnect();
+        setEndpoint("");
+        setAccessKey("");
+        setHfStage("paused");
+      } else {
+        setHfStage("pausing");
+      }
+      setHfMessage(result.message);
+      await refreshHuggingFaceSession(false);
+    } catch (failure) {
+      setHfStage("error");
+      setHfMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Could not pause the Hugging Face Space."
+      );
+      await refreshHuggingFaceSession(false);
+    }
+  };
+
+  const handleClearExpiredLease = async () => {
+    if (!hfAuthorized || !hfCsrfToken || !hfLeaseExpired || !hfLeaseId || busy)
+      return;
+    const confirmed = window.confirm(
+      "The safety lease expired, but the remote Hugging Face job may still be running. First verify in Hugging Face that no generation is active. Clear the safety lock only if you have confirmed the job ended."
+    );
+    if (!confirmed) return;
+    try {
+      await postHuggingFace("generation/clear", {
+        generationId: hfLeaseId,
+        confirmation: "HF_NO_ACTIVE_GENERATION",
+      });
+      setHfGenerationActive(false);
+      setHfLeaseExpired(false);
+      setHfLeaseId("");
+      setHfMessage("Owner-verified generation safety lease cleared.");
+      await refreshHuggingFaceSession(false);
+    } catch (failure) {
+      setHfMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Could not clear the expired generation safety lease."
+      );
+    }
+  };
+
   const handleGenerate = async () => {
     const connection = connectionRef.current;
     if (!canGenerate || !sourceFile || !accentFile || !connection) return;
@@ -666,7 +980,35 @@ export default function Home() {
     setGenerationState("generating");
     const controller = new AbortController();
     generationAbort.current = controller;
+    let hfGenerationId: string | undefined;
+    let hfHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let keepHfLease = false;
     try {
+      if (provider === "huggingface") {
+        const lease = await postHuggingFace<{ generationId: string }>(
+          "generation/start"
+        );
+        hfGenerationId = lease.generationId;
+        setHfLeaseId(lease.generationId);
+        setHfLeaseExpired(false);
+        setHfGenerationActive(true);
+        setHfStage("generating");
+        setHfMessage(
+          "Generation is active. Pause is disabled until it finishes."
+        );
+        hfHeartbeatTimer = setInterval(
+          () => {
+            void postHuggingFace("generation/heartbeat", {
+              generationId: lease.generationId,
+            }).catch(() => {
+              setHfMessage(
+                "The generation lease could not be renewed. Pause remains blocked by the shared safety state."
+              );
+            });
+          },
+          2 * 60 * 1000
+        );
+      }
       const result = await connection.generate(
         {
           sourceVoice: sourceFile,
@@ -682,17 +1024,59 @@ export default function Home() {
       if (!controller.signal.aborted) {
         setOutputBlob(result);
         setGenerationState("complete");
+        if (provider === "huggingface") setHfStage("ready");
       }
     } catch (failure) {
-      setError(safeGenerationError(failure, accessKey));
+      const failureText =
+        failure instanceof Error ? failure.message : String(failure);
+      keepHfLease =
+        provider === "huggingface" &&
+        (controller.signal.aborted ||
+          /stopped listening|exceeded 15 minutes|may still finish/i.test(
+            failureText
+          ));
+      setError(
+        safeGenerationError(
+          failure,
+          accessKey,
+          provider === "huggingface" ? "Hugging Face" : "Colab"
+        )
+      );
       setGenerationState("error");
+      if (provider === "huggingface")
+        setHfStage(keepHfLease ? "starting" : "error");
       // A failed GPU request must be rechecked before another upload.
       connectionRef.current?.close();
       connectionRef.current = null;
       setConnectionState("disconnected");
       setSampleRate(null);
     } finally {
+      if (hfHeartbeatTimer) clearInterval(hfHeartbeatTimer);
       generationAbort.current = null;
+      if (hfGenerationId && !keepHfLease) {
+        try {
+          await postHuggingFace("generation/end", {
+            generationId: hfGenerationId,
+          });
+          setHfGenerationActive(false);
+          setHfLeaseId("");
+          setHfLeaseExpired(false);
+          setHfStage("ready");
+          void refreshHuggingFaceSession(false);
+        } catch {
+          setHfGenerationActive(true);
+          setHfStage("generating");
+          setHfMessage(
+            "Could not confirm that the generation ended; pause remains blocked until its safety lease expires."
+          );
+        }
+      } else if (hfGenerationId && keepHfLease) {
+        setHfGenerationActive(true);
+        setHfStage("starting");
+        setHfMessage(
+          "The client stopped listening; the Hugging Face job may still be running. Pause is blocked while its safety lease remains active."
+        );
+      }
     }
   };
 
@@ -709,7 +1093,10 @@ export default function Home() {
         </a>
         <div className="topbar-right">
           <span className="privacy-chip">
-            <LockKeyhole size={13} /> Your Colab session
+            <LockKeyhole size={13} />{" "}
+            {provider === "huggingface"
+              ? "Hugging Face Space"
+              : "Your Colab session"}
           </span>
         </div>
       </header>
@@ -727,8 +1114,9 @@ export default function Home() {
             <p className="intro-copy">
               Write the exact line, mark where its delivery should shift, and
               optionally add the original speaker’s laugh or giggle. A sob cue
-              needs a cry/sob clip. AccentLab keeps the experimental two-reference
-              conversion on your free T4.
+              needs a cry/sob clip. Colab is the default provider. An authorized
+              owner may deliberately start an optional Hugging Face T4-small at
+              $0.40 per running hour; it stays off until explicitly started.
             </p>
           </div>
           <div className="intro-note">
@@ -739,6 +1127,36 @@ export default function Home() {
           </div>
         </section>
 
+        <div
+          className="provider-choice"
+          role="group"
+          aria-label="Inference provider"
+        >
+          <span className="mini-label">Choose inference provider</span>
+          <div className="provider-choice-buttons">
+            <button
+              className={provider === "colab" ? "is-selected" : ""}
+              type="button"
+              aria-pressed={provider === "colab"}
+              disabled={busy}
+              onClick={() => handleProviderChange("colab")}
+            >
+              Google Colab <small>Default · free T4</small>
+            </button>
+            <button
+              className={provider === "huggingface" ? "is-selected" : ""}
+              type="button"
+              aria-pressed={provider === "huggingface"}
+              disabled={busy}
+              onClick={() => handleProviderChange("huggingface")}
+            >
+              Hugging Face <small>Optional · $0.40/hr T4-small</small>
+            </button>
+          </div>
+        </div>
+
+        {provider === "colab" && (
+          <>
         <section className="colab-panel" aria-labelledby="colab-heading">
           <div className="colab-panel-heading">
             <div>
@@ -755,12 +1173,12 @@ export default function Home() {
             </span>
           </div>
           <p className="colab-instructions">
-            For automatic startup, authorize Google below and use the managed
-            button. For manual fallback, download the notebook, choose a{" "}
-            <strong>T4 GPU</strong> in Colab, then run setup, restart once, and
-            run the GPU check and final backend cell. Copy its URL and session
-            access code. Older notebooks must be replaced to use the expressive
-            text-safe pipeline.
+                For automatic startup, authorize Google below and use the
+                managed button. For manual fallback, download the notebook,
+                choose a <strong>T4 GPU</strong> in Colab, then run setup,
+                restart once, and run the GPU check and final backend cell. Copy
+                its URL and session access code. Older notebooks must be
+                replaced to use the expressive text-safe pipeline.
           </p>
           <div className="colab-actions">
             <a
@@ -784,15 +1202,16 @@ export default function Home() {
               <span className="mini-label">Managed setup</span>
               <h3>Authorize Google, then start the runtime here.</h3>
               <p>
-                AccentLab can start or reuse its own Google Colab runtime and
-                fill the URL and access code when ready. It never stops or
-                deletes a runtime; Google exposes no direct restart operation.
-                If an existing session is stopped or unavailable, restart it
-                manually in Colab. Only an eligible standard T4 on the Free tier
-                is accepted—no paid fallback. Manus server hosting is separate.
-                “Repair &amp; reinstall” asks for confirmation and resets only
-                AccentLab-managed software and worker status; it leaves the
-                runtime, notebook, Drive, and audio files untouched.
+                    AccentLab can start or reuse its own Google Colab runtime
+                    and fill the URL and access code when ready. It never stops
+                    or deletes a runtime; Google exposes no direct restart
+                    operation. If an existing session is stopped or unavailable,
+                    restart it manually in Colab. Only an eligible standard T4
+                    on the Free tier is accepted—no paid fallback. Manus server
+                    hosting is separate. “Repair &amp; reinstall” asks for
+                    confirmation and resets only AccentLab-managed software and
+                    worker status; it leaves the runtime, notebook, Drive, and
+                    audio files untouched.
               </p>
             </div>
             {colabAuthNotice && (
@@ -833,7 +1252,8 @@ export default function Home() {
                   managedStage === "loading" ? (
                     <LoaderCircle className="spin" size={15} />
                   ) : null}
-                  {managedStage === "ready" && connectionState === "connected"
+                      {managedStage === "ready" &&
+                      connectionState === "connected"
                     ? "Free T4 connected"
                     : managedStage === "installing"
                       ? "Installing worker…"
@@ -956,15 +1376,211 @@ export default function Home() {
             </p>
           )}
           <p className="session-note">
-            Free Colab may disconnect without warning. Google says managed free
-            runtimes may terminate web-UI content-generation jobs and lists
-            deepfakes as prohibited; voice conversion may be covered. Confirm
-            this use complies with the <a href="https://research.google.com/colaboratory/faq.html" target="_blank" rel="noreferrer">Colab FAQ</a>.
-            Interrupted takes are not saved; a retry starts the whole script
-            from the beginning. Reconnect before retrying. URL and access code
-            stay only in this page’s memory; don’t share them.
+                Free Colab may disconnect without warning. Google says managed
+                free runtimes may terminate web-UI content-generation jobs and
+                lists deepfakes as prohibited; voice conversion may be covered.
+                Confirm this use complies with the{" "}
+                <a
+                  href="https://research.google.com/colaboratory/faq.html"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Colab FAQ
+                </a>
+                . Interrupted takes are not saved; a retry starts the whole
+                script from the beginning. Reconnect before retrying. URL and
+                access code stay only in this page’s memory; don’t share them.
+              </p>
+            </section>
+          </>
+        )}
+
+        {provider === "huggingface" && (
+          <section
+            className="colab-panel huggingface-panel"
+            aria-labelledby="huggingface-heading"
+          >
+            <div className="colab-panel-heading">
+              <div>
+                <span className="mini-label">Optional paid fallback</span>
+                <h2 id="huggingface-heading">Hugging Face T4-small worker</h2>
+              </div>
+              <span
+                className={`connection-badge ${hfStage === "ready" ? "connected" : hfStage === "starting" || hfStage === "generating" || hfStage === "pausing" ? "connecting" : ""}`}
+              >
+                <span className="status-dot" />
+                {hfStage === "paused"
+                  ? "Paused"
+                  : hfStage === "starting"
+                    ? "Starting"
+                    : hfStage === "ready"
+                      ? "Ready"
+                      : hfStage === "generating"
+                        ? "Generating"
+                        : hfStage === "pausing"
+                          ? "Pausing"
+                          : "Error"}
+              </span>
+            </div>
+            <p className="colab-instructions">
+              T4-small costs{" "}
+              <strong>
+                ${hfPrice.toFixed(2)} per running hour, billed by the minute
+              </strong>{" "}
+              while starting or running. The Space must already exist and be
+              configured as T4-small; enabling GPU may require an eligible plan
+              and billing setup, which this website never enables. AccentLab
+              will not create it, change hardware, or start it automatically.
+              This fallback template has not been validated on a live Hugging
+              Face T4-small; do not rely on it until the full v5 checks pass
+              there. Hugging Face controls are restricted to the allowlisted,
+              verified Google account.
+            </p>
+            {hfAuthNotice && (
+              <p className="managed-notice" role="status">
+                {hfAuthNotice}
+              </p>
+            )}
+            {hfSessionLoading ? (
+              <p className="managed-status">
+                <LoaderCircle className="spin" size={14} /> Checking Hugging
+                Face configuration without starting compute…
+              </p>
+            ) : hfConfigured === false ? (
+              <p className="managed-notice" role="status">
+                {hfMessage ||
+                  "Hugging Face is not configured. No Space or paid worker has been created."}
+              </p>
+            ) : !hfAuthorized ? (
+              <div className="managed-runtime-controls">
+                <a className="managed-cta" href="/api/huggingface/oauth/start">
+                  Authorize owner Google account <ArrowUpRight size={15} />
+                </a>
+                <p className="managed-status">
+                  Only the server-side allowlisted Google account can obtain
+                  control access. The Hugging Face token is never sent to this
+                  page.
+                </p>
+              </div>
+            ) : (
+              <div className="managed-runtime-controls">
+                <button
+                  className="colab-link"
+                  type="button"
+                  onClick={() => void refreshHuggingFaceSession(false)}
+                >
+                  Refresh Space status
+                </button>
+                {hfStage === "paused" && (
+                  <button
+                    className="managed-cta managed-start-button"
+                    type="button"
+                    disabled={
+                      busy || hfGenerationActive || !hfHardwareConfirmed
+                    }
+                    onClick={() => void handleStartHuggingFace()}
+                  >
+                    Start T4-small · ${hfPrice.toFixed(2)}/hour
+                  </button>
+                )}
+                {hfStage === "paused" && !hfHardwareConfirmed && (
+                  <p className="managed-notice" role="status">
+                    The Space must already request T4-small in its Hugging Face
+                    hardware settings. AccentLab will not change hardware or
+                    send a start request until the server confirms this exact
+                    type.
+                  </p>
+                )}
+                {hfStage === "starting" && (
+                  <p className="managed-status">
+                    <LoaderCircle className="spin" size={14} /> Starting/loading
+                    the paused T4-small Space…
+                  </p>
+                )}
+                {hfStage === "ready" && connectionState !== "connected" && (
+                  <button
+                    className="managed-cta managed-start-button"
+                    type="button"
+                    disabled={
+                      busy ||
+                      !hfSpaceUrl ||
+                      !hfAccessKey ||
+                      connectionState === "connecting"
+                    }
+                    onClick={() =>
+                      void connectWithCredentials(
+                        hfSpaceUrl,
+                        hfAccessKey,
+                        "Hugging Face"
+                      )
+                    }
+                  >
+                    {connectionState === "connecting" ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : null}
+                    Connect to ready worker
+                  </button>
+                )}
+                {hfRuntimeRunning && (
+                  <button
+                    className="managed-cta managed-repair-button"
+                    type="button"
+                    disabled={
+                      busy || hfGenerationActive || hfStage === "pausing"
+                    }
+                    onClick={() => void handlePauseHuggingFace()}
+                  >
+                    {hfStage === "pausing" ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : null}
+                    Pause Hugging Face worker
+                  </button>
+                )}
+                {hfGenerationActive && (
+                  <p className="managed-notice is-error" role="status">
+                    A generation may still be active. Pause is blocked while its
+                    durable safety lease is active.
+                  </p>
+                )}
+                {hfGenerationActive && hfLeaseExpired && (
+                  <>
+                    <p className="managed-notice is-error" role="alert">
+                      The one-hour lease expired, but the remote job may still
+                      be running. Check the Hugging Face Space before clearing
+                      this lock.
+                    </p>
+                    <button
+                      className="colab-link"
+                      type="button"
+                      onClick={() => void handleClearExpiredLease()}
+                    >
+                      I verified no generation is active — clear safety lock
+                    </button>
+                  </>
+                )}
+                {hfMessage && (
+                  <p
+                    className={`managed-status ${hfStage === "error" ? "is-error" : ""}`}
+                    role="status"
+                  >
+                    {hfStage === "starting" || hfStage === "pausing" ? (
+                      <LoaderCircle className="spin" size={14} />
+                    ) : null}
+                    {hfMessage}
+                  </p>
+                )}
+              </div>
+            )}
+            <p className="session-note">
+              Starting requires a separate confirmation displaying the T4-small
+              price. Pause stops only the Hugging Face worker—not Colab or this
+              website. Inputs are uploaded only when you generate and the Space
+              deletes those uploads after the attempt; no Google Drive access is
+              used. If you stop listening, the worker may continue the current
+              take, so pause remains blocked for the safety lease.
           </p>
         </section>
+        )}
 
         <div className="stage-line" aria-hidden="true">
           <span className="stage-line-fill" />
@@ -1044,7 +1660,9 @@ export default function Home() {
                 <div className="cue-group">
                   <span className="mini-label">Mood</span>
                   <div className="cue-buttons">
-                    {(["neutral", "playful", "excited", "sad", "calm"] as const).map(mood => (
+                    {(
+                      ["neutral", "playful", "excited", "sad", "calm"] as const
+                    ).map(mood => (
                       <button
                         className="cue-button"
                         key={mood}
@@ -1060,11 +1678,13 @@ export default function Home() {
                 <div className="cue-group">
                   <span className="mini-label">Vocal moment</span>
                   <div className="cue-buttons">
-                    {([
+                    {(
+                      [
                       ["laugh", "Laugh"],
                       ["giggle", "Giggle"],
                       ["sob", "Sob"],
-                    ] as const).map(([cue, label]) => (
+                      ] as const
+                    ).map(([cue, label]) => (
                       <button
                         className="cue-button cue-button-event"
                         key={cue}
@@ -1080,17 +1700,21 @@ export default function Home() {
               </div>
               <div className="script-footer">
                 <span className="tip">
-                  <Sparkles size={13} /> Punctuation shapes pauses; cues are removed before speech.
+                  <Sparkles size={13} /> Punctuation shapes pauses; cues are
+                  removed before speech.
                 </span>
                 <span className="char-count">{script.length} / 1,200</span>
               </div>
             </div>
             <div className="expression-sample-panel">
               <div className="sample-panel-heading">
-                <span className="mini-label">Original-speaker vocal samples</span>
+                <span className="mini-label">
+                  Original-speaker vocal samples
+                </span>
                 <p>
                   Laugh/giggle clips are optional; without one, those cues are
-                  skipped. A [sob] cue needs a clip. Only matching event clips upload.
+                  skipped. A [sob] cue needs a clip. Only matching event clips
+                  upload.
                 </p>
               </div>
               <div className="expression-samples">
@@ -1123,7 +1747,9 @@ export default function Home() {
                   ? "Use no more than six laugh, giggle, or sob cues in one take."
                   : expression.missingSamples.length
                     ? `Add the original speaker’s ${expression.missingSamples.join(" and ")} sample to use those cues.${expression.hasLaughCue && !laughSample ? " Laugh/giggle cues remain optional and will be skipped without their clip." : ""}`
-                    : expression.hasLaughCue && !laughSample && !expression.hasSpeech
+                    : expression.hasLaughCue &&
+                        !laughSample &&
+                        !expression.hasSpeech
                       ? "A laugh clip is optional when speech is present; a laugh-only take needs the clip or spoken words."
                       : expression.hasLaughCue && !laughSample
                       ? "The laugh/giggle sample is optional. These cues will be skipped; no laugh sound is generated."
@@ -1161,7 +1787,11 @@ export default function Home() {
               <span>
                 I have permission from both reference speakers, and from the
                 original speaker for any laugh/giggle or cry/sob sample, to
-                process these recordings through temporary Colab and Gradio sessions.
+                process these recordings through a temporary{" "}
+                {provider === "huggingface"
+                  ? "Hugging Face Space and Gradio session"
+                  : "Colab and Gradio session"}
+                .
               </span>
             </label>
           </section>
@@ -1177,7 +1807,11 @@ export default function Home() {
               {busy ? (
                 <div className="generation-output">
                   <LoaderCircle className="spin" size={30} />
-                  <span className="mini-label">Colab conversion</span>
+                  <span className="mini-label">
+                    {provider === "huggingface"
+                      ? "Hugging Face conversion"
+                      : "Colab conversion"}
+                  </span>
                   <h2>Creating your new recording.</h2>
                   <p>{progress.message}</p>
                   {typeof progress.fraction === "number" && (
@@ -1188,11 +1822,15 @@ export default function Home() {
                     />
                   )}
                   <p className="output-caveat">
-                    Pronunciation Guard checks every requested word locally after conversion.
-                    Mood cues use small pitch/rate shifts and may sound subtle.
-                    Supplied event clips are inserted; laugh/giggle cues without
-                    an optional clip are skipped. Free Colab may disconnect; this
-                    take cannot resume mid-script, and retrying starts from the beginning.
+                    Pronunciation Guard checks every requested word locally
+                    after conversion. Mood cues use small pitch/rate shifts and
+                    may sound subtle. Supplied event clips are inserted;
+                    laugh/giggle cues without an optional clip are skipped.{" "}
+                    {provider === "huggingface"
+                      ? "Hugging Face may queue or pause; this"
+                      : "Free Colab may disconnect; this"}
+                    take cannot resume mid-script, and retrying starts from the
+                    beginning.
                   </p>
                 </div>
               ) : generationState === "complete" && outputUrl ? (
@@ -1252,7 +1890,7 @@ export default function Home() {
                   <p>
                     {connectionState === "connected"
                       ? "Load both references, write your line, add cues if useful, and confirm permission."
-                      : "Connect Colab above, load both references, then write your line and cue its delivery."}
+                      : `Connect ${provider === "huggingface" ? "the Hugging Face worker" : "Colab"} above, load both references, then write your line and cue its delivery.`}
                   </p>
                   <div className="output-spec">
                     <span>Output</span>
@@ -1271,7 +1909,9 @@ export default function Home() {
               disabled={!canGenerate}
             >
               <Wand2 size={17} />
-              {busy ? "Converting on Colab…" : "Generate voice preview"}
+              {busy
+                ? `Converting on ${provider === "huggingface" ? "Hugging Face" : "Colab"}…`
+                : "Generate voice preview"}
               <ArrowUpRight size={16} />
             </button>
             {busy && (
@@ -1285,7 +1925,8 @@ export default function Home() {
             )}
             <p className="provider-note">
               <LockKeyhole size={12} />
-              References upload when generating; event clips only upload when cued.
+              References upload when generating; event clips only upload when
+              cued.
             </p>
           </aside>
         </section>
@@ -1296,22 +1937,25 @@ export default function Home() {
             <strong>
               An experimental voice-conversion tool, not a perfect voice clone.
             </strong>{" "}
-            The current identity-anchored v5 expressive pipeline retains the
-            v3 two-pass text-safe baseline, chunks speech, and verifies spoken
-            words before returning audio.
-            The original recording guides identity and the accent reference
-            guides accent/style; the model does not perfectly separate them.
-            Mood cues only apply small supported pitch/rate changes, so their
-            effect is approximate. A laugh/giggle clip is optional; without one,
-            those cues are skipped. A sob cue requires the original speaker’s
-            supplied cry/sob clip. AccentLab does not claim to synthesize those
-            sounds. Write your own joke and mark its
-            delivery—jokes are not generated or detected automatically. No
-            85–95% speaker-similarity guarantee is available. Microsoft’s Edge
-            speech service receives the script to make a temporary scaffold;
-            Seed-VC must produce the final converted speech. Audio passes
-            through Gradio sharing and is processed temporarily on Colab. Don’t
-            use sensitive scripts or recordings.
+            The current identity-anchored v5 expressive pipeline retains the v3
+            two-pass text-safe baseline, chunks speech, and verifies spoken
+            words before returning audio. The original recording guides identity
+            and the accent reference guides accent/style; the model does not
+            perfectly separate them. Mood cues only apply small supported
+            pitch/rate changes, so their effect is approximate. A laugh/giggle
+            clip is optional; without one, those cues are skipped. A sob cue
+            requires the original speaker’s supplied cry/sob clip. AccentLab
+            does not claim to synthesize those sounds. Write your own joke and
+            mark its delivery—jokes are not generated or detected automatically.
+            No 85–95% speaker-similarity guarantee is available. Microsoft’s
+            Edge speech service receives the script to make a temporary
+            scaffold; Seed-VC must produce the final converted speech. Audio
+            passes through a temporary Gradio session and is processed on the
+            selected provider. The Hugging Face template does not attach
+            persistent storage; it deletes input uploads after each attempt and
+            automatically cleans orphaned cache entries and returned audio after
+            a short temporary window. No Google Drive is used. Don’t use
+            sensitive scripts or recordings.
           </p>
         </section>
         <section className="how-it-works">
@@ -1332,7 +1976,11 @@ export default function Home() {
           <div className="how-step">
             <span className="how-number">03</span>
             <strong>Generate</strong>
-            <p>Colab converts verified speech and places marked voice moments.</p>
+            <p>
+              {provider === "huggingface"
+                ? "Hugging Face converts verified speech and places marked voice moments."
+                : "Colab converts verified speech and places marked voice moments."}
+            </p>
           </div>
         </section>
       </main>

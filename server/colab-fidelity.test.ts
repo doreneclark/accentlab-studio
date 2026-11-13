@@ -11,6 +11,7 @@ import ast
 import math
 import io
 import json
+import os
 import secrets
 import sys
 import tempfile
@@ -33,7 +34,9 @@ wanted = {
     "_safe_wav_audio",
     "_collect_final_audio",
     "_convert_once",
+    "_generate_impl",
     "_generate",
+    "_remove_hosted_uploads",
     "_split_script",
     "_join_audio_chunks",
     "_normalize_words",
@@ -55,6 +58,7 @@ namespace = {
     "secrets": secrets,
     "tempfile": tempfile,
     "threading": threading,
+    "os": os,
 }
 class GrError(Exception):
     pass
@@ -87,6 +91,7 @@ namespace["MAX_SCRIPT_CHARS"] = 1200
 namespace["CHUNK_TARGET_CHARS"] = 260
 namespace["CHUNK_GAP_SECONDS"] = 0.08
 namespace["MODEL_ERROR"] = None
+namespace["HOSTED_SPACE"] = False
 namespace["OUTPUT_DIR"] = Path(tempfile.mkdtemp(prefix="accentlab-fidelity-"))
 namespace["OUTPUT_RETENTION_SECONDS"] = 3600
 
@@ -324,6 +329,16 @@ assert unauthorized.get("ready") is False
 assert unauthorized.get("gpu") is False
 assert unauthorized.get("sample_rate") == 22050
 assert unauthorized.get("message") == "Invalid access code."
+
+# Hosted mode deletes uploaded reference files from its Gradio temp folder.
+upload_root = Path(tempfile.mkdtemp(prefix="accentlab-hf-upload-"))
+upload_path = upload_root / "reference.wav"
+upload_path.write_bytes(b"temporary")
+os.environ["GRADIO_TEMP_DIR"] = str(upload_root)
+namespace["HOSTED_SPACE"] = True
+namespace["_remove_hosted_uploads"]([str(upload_path)])
+assert not upload_path.exists(), "hosted input uploads must be scrubbed after generation"
+namespace["HOSTED_SPACE"] = False
 print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v5-expressive-text-safe"}))
 `;
 

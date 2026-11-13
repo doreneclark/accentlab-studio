@@ -15,11 +15,13 @@ type Handler = (req: any, res: any, next?: () => Promise<void>) => unknown;
 class FakeApp {
   routes = new Map<string, Handler[]>();
   get(path: string, ...handlers: Handler[]) {
-    this.routes.set(`GET ${path}`, handlers);
+    const key = `GET ${path}`;
+    this.routes.set(key, [...(this.routes.get(key) ?? []), ...handlers]);
     return this;
   }
   post(path: string, ...handlers: Handler[]) {
-    this.routes.set(`POST ${path}`, handlers);
+    const key = `POST ${path}`;
+    this.routes.set(key, [...(this.routes.get(key) ?? []), ...handlers]);
     return this;
   }
 }

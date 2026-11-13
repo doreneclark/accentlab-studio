@@ -4,6 +4,7 @@ import {
   ColabConnection,
   MAX_AUDIO_BYTES,
   REQUIRED_PIPELINE_VERSION,
+  normalizeHuggingFaceEndpoint,
   normalizeEndpoint,
   resultAudioUrl,
   safeError,
@@ -20,6 +21,7 @@ vi.mock("@gradio/client", () => ({
   handle_file: mocks.handleFile,
 }));
 const endpoint = "https://test-session.gradio.live";
+const huggingFaceEndpoint = "https://owner-accentlab.hf.space";
 const accessKey = "test-session-code-never-real";
 const status = {
   ready: true,
@@ -72,6 +74,21 @@ beforeEach(() => {
 describe("Colab URL and audio validation", () => {
   it("accepts a clean temporary Gradio origin", () =>
     expect(normalizeEndpoint(` ${endpoint}/ `)).toBe(endpoint));
+  it("accepts a clean Hugging Face Space origin", () =>
+    expect(normalizeHuggingFaceEndpoint(` ${huggingFaceEndpoint}/ `)).toBe(
+      huggingFaceEndpoint
+    ));
+  it.each([
+    "http://owner-accentlab.hf.space",
+    "https://evil.example",
+    "https://owner-accentlab.hf.space/path",
+    "https://user:pass@owner-accentlab.hf.space",
+    "https://owner-accentlab.hf.space?token=abc",
+    "https://owner-accentlab.hf.space.evil.example",
+    "https://owner-accentlab.hf.space:8443",
+  ])("rejects unsafe Hugging Face endpoint %s", url =>
+    expect(() => normalizeHuggingFaceEndpoint(url)).toThrow()
+  );
   it.each([
     "http://test.gradio.live",
     "https://evil.example",
@@ -147,6 +164,23 @@ describe("Colab connection", () => {
     connection.close();
     connection.close();
     expect(remote.close).toHaveBeenCalledTimes(1);
+  });
+  it("checks the Hugging Face Space's v5 status before any audio upload", async () => {
+    const remote = client();
+    mocks.connect.mockResolvedValue(remote);
+    const connection = await ColabConnection.connect(
+      huggingFaceEndpoint,
+      accessKey,
+      "Hugging Face"
+    );
+    expect(mocks.connect).toHaveBeenCalledWith(huggingFaceEndpoint, {
+      events: ["status", "data"],
+      record_history: false,
+    });
+    expect(remote.predict).toHaveBeenCalledWith("/status", [accessKey]);
+    expect(mocks.handleFile).not.toHaveBeenCalled();
+    expect(connection.status).toEqual(status);
+    connection.close();
   });
   it("rejects the old placeholder notebook", async () => {
     const remote = client({
@@ -254,15 +288,22 @@ describe("Colab generation", () => {
     mocks.connect.mockResolvedValue(remote);
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" }))
-      )
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" })
+          )
+        )
     );
     const connection = await ColabConnection.connect(endpoint, accessKey);
     const value = {
       ...input(),
       script: "[mood:playful]That was funny. [giggle]",
-      laughSample: new File(["laugh"], "laugh.wav") as unknown as globalThis.File,
+      laughSample: new File(
+        ["laugh"],
+        "laugh.wav"
+      ) as unknown as globalThis.File,
     };
     await connection.generate(value, vi.fn());
     expect(remote.submit).toHaveBeenCalledWith("/generate", [
@@ -287,9 +328,13 @@ describe("Colab generation", () => {
     mocks.connect.mockResolvedValue(remote);
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" }))
-      )
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            new Blob(["RIFF1234WAVEconverted"], { type: "audio/wav" })
+          )
+        )
     );
     const connection = await ColabConnection.connect(endpoint, accessKey);
     const value = { ...input(), script: "That was funny. [giggle]" };
