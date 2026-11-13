@@ -442,9 +442,12 @@ export function registerHuggingFaceApiRoutes(
     res.redirect(302, `https://accounts.google.com/o/oauth2/v2/auth?${params}`);
   });
 
-  app.get(HUGGINGFACE_CALLBACK_PATH, async (req, res) => {
+  app.get(HUGGINGFACE_CALLBACK_PATH, async (req, res, next: NextFunction) => {
     const stateCookie = cookieValue(req, HUGGINGFACE_STATE_COOKIE);
-    if (!stateCookie) return;
+    if (!stateCookie) {
+      next();
+      return;
+    }
     res.set("Cache-Control", "no-store");
     clearCookie(res, HUGGINGFACE_STATE_COOKIE, allowInsecureCookies);
     if (!configured) {

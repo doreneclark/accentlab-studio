@@ -1069,7 +1069,10 @@ export function registerColabApiRoutes(
   app.get(
     COLAB_CALLBACK_PATH,
     async (req: Request, res: ExpressResponse, next: NextFunction) => {
-      if (readCookie(req, HUGGINGFACE_STATE_COOKIE)) {
+      if (
+        readCookie(req, HUGGINGFACE_STATE_COOKIE) ||
+        readCookie(req, "accentlab_modal_oauth_state")
+      ) {
         next();
         return;
       }

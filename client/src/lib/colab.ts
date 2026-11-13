@@ -120,7 +120,9 @@ export function safeError(
   ) {
     return provider === "Hugging Face"
       ? "The Hugging Face Space is unreachable or has paused. Check its state and start it deliberately before reconnecting."
-      : "The Colab session is unreachable or has expired. Keep Colab running, then reconnect using its current URL and session code.";
+      : provider === "Modal"
+        ? "The Modal serverless worker is unreachable or still starting. Check the worker deployment and wait for the current request before trying again."
+        : "The Colab session is unreachable or has expired. Keep Colab running, then reconnect using its current URL and session code.";
   }
   return redacted.slice(0, 350);
 }

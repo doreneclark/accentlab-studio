@@ -1418,7 +1418,13 @@ a:focus-visible {
 .huggingface-panel {
   border-left-color: #d18b37;
 }
+.modal-panel {
+  border-left-color: #526c9a;
+}
 .huggingface-panel .managed-notice {
+  margin: 4px 0;
+}
+.modal-panel .managed-notice {
   margin: 4px 0;
 }
 @media (max-width: 650px) {

@@ -30,10 +30,13 @@ import {
   progressHttpDiagnostic,
   readProgressResponse,
 } from "@/lib/colab-progress";
-import { analyzeExpressionScript } from "@/lib/expression-cues";
+import {
+  analyzeExpressionScript,
+} from "@/lib/expression-cues";
+import { generateWithModal } from "@/lib/modal";
 
 type RecordingKind = "source" | "accent" | "laugh" | "sob";
-type Provider = "colab" | "huggingface";
+type Provider = "colab" | "huggingface" | "modal";
 type GenerationState = "idle" | "generating" | "complete" | "error";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type ManagedStage = "idle" | "installing" | "loading" | "ready" | "error";
@@ -69,6 +72,13 @@ interface HuggingFaceSessionResponse {
   accessKey?: string;
   message?: string;
   error?: string;
+}
+
+interface ModalSessionResponse {
+  configured: boolean;
+  authorized: boolean;
+  csrfToken?: string;
+  message?: string;
 }
 
 interface ColabLaunchResponse {
@@ -263,6 +273,12 @@ export default function Home() {
   const [hfGenerationActive, setHfGenerationActive] = useState(false);
   const [hfLeaseExpired, setHfLeaseExpired] = useState(false);
   const [hfLeaseId, setHfLeaseId] = useState("");
+  const [modalConfigured, setModalConfigured] = useState<boolean | null>(null);
+  const [modalAuthorized, setModalAuthorized] = useState(false);
+  const [modalSessionLoading, setModalSessionLoading] = useState(true);
+  const [modalCsrfToken, setModalCsrfToken] = useState("");
+  const [modalMessage, setModalMessage] = useState("");
+  const [modalAuthNotice, setModalAuthNotice] = useState("");
   const [managedStage, setManagedStage] = useState<ManagedStage>("idle");
   const [managedMessage, setManagedMessage] = useState("");
   const [sampleRate, setSampleRate] = useState<number | null>(null);
@@ -298,7 +314,9 @@ export default function Home() {
       expression.missingSamples.length === 0 &&
       !expression.tooManyVocalizations &&
       consent &&
-      connectionState === "connected" &&
+      (provider === "modal"
+        ? modalAuthorized && Boolean(modalCsrfToken)
+        : connectionState === "connected") &&
       !busy
   );
   const estimatedSeconds = useMemo(
@@ -331,6 +349,7 @@ export default function Home() {
     const query = new URLSearchParams(window.location.search);
     const authResult = query.get("colab_auth");
     const hfAuthResult = query.get("hf_auth");
+    const modalAuthResult = query.get("modal_auth");
     if (authResult) {
       query.delete("colab_auth");
       const nextQuery = query.toString();
@@ -359,6 +378,20 @@ export default function Home() {
         hfAuthResult === "success"
           ? "Google identity verified. Hugging Face controls are available only if this is the allowlisted account."
           : "Google identity verification did not complete. Hugging Face controls remain unavailable."
+      );
+    }
+    if (modalAuthResult) {
+      query.delete("modal_auth");
+      const nextQuery = query.toString();
+      window.history.replaceState(
+        window.history.state,
+        document.title,
+        `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${window.location.hash}`
+      );
+      setModalAuthNotice(
+        modalAuthResult === "success"
+          ? "Google identity verified. Modal generation is restricted to the allowlisted owner account."
+          : "Google identity verification did not complete. Modal remains unavailable."
       );
     }
 
@@ -604,6 +637,40 @@ export default function Home() {
       setHfSessionLoading(false);
     }
   };
+
+  const refreshModalSession = async () => {
+    setModalSessionLoading(true);
+    try {
+      const response = await fetch("/api/modal/session", {
+        credentials: "include",
+        cache: "no-store",
+      });
+      const body = (await response
+        .json()
+        .catch(() => ({}))) as ModalSessionResponse;
+      if (!response.ok)
+        throw new Error(body.message || "Could not check Modal authorization.");
+      setModalConfigured(body.configured);
+      setModalAuthorized(body.authorized);
+      setModalCsrfToken(body.csrfToken || "");
+      setModalMessage(body.message || "");
+    } catch (failure) {
+      setModalConfigured(null);
+      setModalAuthorized(false);
+      setModalCsrfToken("");
+      setModalMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Could not check Modal authorization."
+      );
+    } finally {
+      setModalSessionLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshModalSession();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -879,6 +946,7 @@ export default function Home() {
     resetOutput();
     setProvider(next);
     if (next === "huggingface") void refreshHuggingFaceSession(false);
+    if (next === "modal") void refreshModalSession();
   };
 
   const handleStartHuggingFace = async () => {
@@ -975,7 +1043,13 @@ export default function Home() {
 
   const handleGenerate = async () => {
     const connection = connectionRef.current;
-    if (!canGenerate || !sourceFile || !accentFile || !connection) return;
+    if (
+      !canGenerate ||
+      !sourceFile ||
+      !accentFile ||
+      (provider !== "modal" && !connection)
+    )
+      return;
     resetOutput();
     setGenerationState("generating");
     const controller = new AbortController();
@@ -1009,18 +1083,23 @@ export default function Home() {
           2 * 60 * 1000
         );
       }
-      const result = await connection.generate(
-        {
-          sourceVoice: sourceFile,
-          accentReference: accentFile,
-          script,
-          consent,
-          laughSample: expression.hasLaughCue ? laughSample : null,
-          sobSample: expression.needsSobSample ? sobSample : null,
-        },
-        setProgress,
-        controller.signal
-      );
+      const input = {
+        sourceVoice: sourceFile,
+        accentReference: accentFile,
+        script,
+        consent,
+        laughSample: expression.hasLaughCue ? laughSample : null,
+        sobSample: expression.needsSobSample ? sobSample : null,
+      };
+      const result =
+        provider === "modal"
+          ? await generateWithModal(
+              input,
+              modalCsrfToken,
+              setProgress,
+              controller.signal
+            )
+          : await connection!.generate(input, setProgress, controller.signal);
       if (!controller.signal.aborted) {
         setOutputBlob(result);
         setGenerationState("complete");
@@ -1039,7 +1118,11 @@ export default function Home() {
         safeGenerationError(
           failure,
           accessKey,
-          provider === "huggingface" ? "Hugging Face" : "Colab"
+          provider === "huggingface"
+            ? "Hugging Face"
+            : provider === "modal"
+              ? "Modal"
+              : "Colab"
         )
       );
       setGenerationState("error");
@@ -1096,7 +1179,9 @@ export default function Home() {
             <LockKeyhole size={13} />{" "}
             {provider === "huggingface"
               ? "Hugging Face Space"
-              : "Your Colab session"}
+              : provider === "modal"
+                ? "Modal serverless worker"
+                : "Your Colab session"}
           </span>
         </div>
       </header>
@@ -1114,9 +1199,10 @@ export default function Home() {
             <p className="intro-copy">
               Write the exact line, mark where its delivery should shift, and
               optionally add the original speaker’s laugh or giggle. A sob cue
-              needs a cry/sob clip. Colab is the default provider. An authorized
-              owner may deliberately start an optional Hugging Face T4-small at
-              $0.40 per running hour; it stays off until explicitly started.
+              needs a cry/sob clip. Colab is the default provider. The optional
+              Hugging Face worker is explicitly started by its owner; Modal is
+              an owner-authorized serverless fallback that runs only when a
+              generation is requested and scales down afterward.
             </p>
           </div>
           <div className="intro-note">
@@ -1151,6 +1237,15 @@ export default function Home() {
               onClick={() => handleProviderChange("huggingface")}
             >
               Hugging Face <small>Optional · $0.40/hr T4-small</small>
+            </button>
+            <button
+              className={provider === "modal" ? "is-selected" : ""}
+              type="button"
+              aria-pressed={provider === "modal"}
+              disabled={busy}
+              onClick={() => handleProviderChange("modal")}
+            >
+              Modal <small>Optional · serverless T4</small>
             </button>
           </div>
         </div>
@@ -1582,6 +1677,94 @@ export default function Home() {
         </section>
         )}
 
+        {provider === "modal" && (
+          <section
+            className="colab-panel modal-panel"
+            aria-labelledby="modal-heading"
+          >
+            <div className="colab-panel-heading">
+              <div>
+                <span className="mini-label">Optional paid fallback</span>
+                <h2 id="modal-heading">Modal serverless v5 worker</h2>
+              </div>
+              <span
+                className={`connection-badge ${modalAuthorized ? "connected" : ""}`}
+              >
+                <span className="status-dot" />
+                {modalSessionLoading
+                  ? "Checking"
+                  : modalAuthorized
+                    ? "Owner verified"
+                    : "Not authorized"}
+              </span>
+            </div>
+            <p className="colab-instructions">
+              Modal does not keep a paid GPU running between takes. Selecting
+              this provider alone starts nothing; each authorized Generate
+              action sends one request to the serverless T4, which scales down
+              after the job. There is no separate warm-start or pause button.
+              Usage charges are still possible while the request runs. Before
+              adding deployment credentials, set a <strong>$10 Workspace
+              budget and a $10 spend limit in Modal</strong>; the website cannot
+              enforce that billing cap. No Modal compute or billing is enabled
+              by local development or this status check.
+            </p>
+            {modalAuthNotice && (
+              <p className="managed-notice" role="status">
+                {modalAuthNotice}
+              </p>
+            )}
+            {modalSessionLoading ? (
+              <p className="managed-status">
+                <LoaderCircle className="spin" size={14} /> Checking Modal
+                configuration without starting compute…
+              </p>
+            ) : modalConfigured === false ? (
+              <p className="managed-notice" role="status">
+                {modalMessage ||
+                  "Modal is not configured. No worker has been started and no paid compute has been enabled."}
+              </p>
+            ) : modalConfigured === null ? (
+              <p className="managed-notice is-error" role="alert">
+                {modalMessage || "Modal configuration could not be checked."}
+              </p>
+            ) : !modalAuthorized ? (
+              <div className="managed-runtime-controls">
+                <a className="managed-cta" href="/api/modal/oauth/start">
+                  Authorize owner Google account <ArrowUpRight size={15} />
+                </a>
+                <p className="managed-status">
+                  Only the server-side verified Google allowlist can generate
+                  through the protected proxy. Worker credentials never reach
+                  this page.
+                </p>
+              </div>
+            ) : (
+              <div className="managed-runtime-controls">
+                <button
+                  className="colab-link"
+                  type="button"
+                  onClick={() => void refreshModalSession()}
+                >
+                  Refresh Modal authorization
+                </button>
+                <p className="managed-status">
+                  Owner verified. Modal starts only when you press Generate; no
+                  automatic retries are sent. If you stop listening, the
+                  worker may finish the in-flight request before scaling down.
+                </p>
+              </div>
+            )}
+            <p className="session-note">
+              Inputs are forwarded only with an authorized generation request
+              and are held in temporary worker storage for the attempt. Do not
+              upload sensitive recordings or scripts. Modal must be deployed
+              separately; this project does not create a Workspace, set limits,
+              enable billing, or deploy a worker automatically.
+            </p>
+          </section>
+        )}
+
         <div className="stage-line" aria-hidden="true">
           <span className="stage-line-fill" />
         </div>
@@ -1790,7 +1973,9 @@ export default function Home() {
                 process these recordings through a temporary{" "}
                 {provider === "huggingface"
                   ? "Hugging Face Space and Gradio session"
-                  : "Colab and Gradio session"}
+                  : provider === "modal"
+                    ? "Modal serverless worker"
+                    : "Colab and Gradio session"}
                 .
               </span>
             </label>
@@ -1810,7 +1995,9 @@ export default function Home() {
                   <span className="mini-label">
                     {provider === "huggingface"
                       ? "Hugging Face conversion"
-                      : "Colab conversion"}
+                      : provider === "modal"
+                        ? "Modal serverless conversion"
+                        : "Colab conversion"}
                   </span>
                   <h2>Creating your new recording.</h2>
                   <p>{progress.message}</p>
@@ -1828,7 +2015,9 @@ export default function Home() {
                     laugh/giggle cues without an optional clip are skipped.{" "}
                     {provider === "huggingface"
                       ? "Hugging Face may queue or pause; this"
-                      : "Free Colab may disconnect; this"}
+                      : provider === "modal"
+                        ? "Modal may cold-start; stopping the browser wait does not guarantee the remote job stopped. This"
+                        : "Free Colab may disconnect; this"}
                     take cannot resume mid-script, and retrying starts from the
                     beginning.
                   </p>
@@ -1888,7 +2077,10 @@ export default function Home() {
                   <span className="mini-label">Waiting for your take</span>
                   <h2>Your new line will land here.</h2>
                   <p>
-                    {connectionState === "connected"
+                    {provider === "modal"
+                      ? modalAuthorized
+                        ? "Load both references, write your line, add cues if useful, and confirm permission. Generate sends one owner-authorized request to Modal.": "Authorize the allowlisted owner account above, then load both references and draft your line."
+                      : connectionState === "connected"
                       ? "Load both references, write your line, add cues if useful, and confirm permission."
                       : `Connect ${provider === "huggingface" ? "the Hugging Face worker" : "Colab"} above, load both references, then write your line and cue its delivery.`}
                   </p>
@@ -1910,7 +2102,7 @@ export default function Home() {
             >
               <Wand2 size={17} />
               {busy
-                ? `Converting on ${provider === "huggingface" ? "Hugging Face" : "Colab"}…`
+                ? `Converting on ${provider === "huggingface" ? "Hugging Face" : provider === "modal" ? "Modal" : "Colab"}…`
                 : "Generate voice preview"}
               <ArrowUpRight size={16} />
             </button>
@@ -1920,7 +2112,9 @@ export default function Home() {
                 type="button"
                 onClick={() => generationAbort.current?.abort()}
               >
-                Stop listening to this job
+                {provider === "modal"
+                  ? "Stop waiting (Modal job may continue)"
+                  : "Stop listening to this job"}
               </button>
             )}
             <p className="provider-note">
@@ -1950,8 +2144,8 @@ export default function Home() {
             No 85–95% speaker-similarity guarantee is available. Microsoft’s
             Edge speech service receives the script to make a temporary
             scaffold; Seed-VC must produce the final converted speech. Audio
-            passes through a temporary Gradio session and is processed on the
-            selected provider. The Hugging Face template does not attach
+            passes through a temporary Gradio session for Colab and Hugging Face;
+            Modal receives one request through a protected server proxy. The Hugging Face template does not attach
             persistent storage; it deletes input uploads after each attempt and
             automatically cleans orphaned cache entries and returned audio after
             a short temporary window. No Google Drive is used. Don’t use
@@ -1979,7 +2173,9 @@ export default function Home() {
             <p>
               {provider === "huggingface"
                 ? "Hugging Face converts verified speech and places marked voice moments."
-                : "Colab converts verified speech and places marked voice moments."}
+                : provider === "modal"
+                  ? "Modal serverless converts verified speech and places marked voice moments on an owner-requested take."
+                  : "Colab converts verified speech and places marked voice moments."}
             </p>
           </div>
         </section>

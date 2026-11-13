@@ -92,6 +92,7 @@ namespace["CHUNK_TARGET_CHARS"] = 260
 namespace["CHUNK_GAP_SECONDS"] = 0.08
 namespace["MODEL_ERROR"] = None
 namespace["HOSTED_SPACE"] = False
+namespace["HOSTED_RUNTIME"] = False
 namespace["OUTPUT_DIR"] = Path(tempfile.mkdtemp(prefix="accentlab-fidelity-"))
 namespace["OUTPUT_RETENTION_SECONDS"] = 3600
 
@@ -336,9 +337,11 @@ upload_path = upload_root / "reference.wav"
 upload_path.write_bytes(b"temporary")
 os.environ["GRADIO_TEMP_DIR"] = str(upload_root)
 namespace["HOSTED_SPACE"] = True
+namespace["HOSTED_RUNTIME"] = True
 namespace["_remove_hosted_uploads"]([str(upload_path)])
 assert not upload_path.exists(), "hosted input uploads must be scrubbed after generation"
 namespace["HOSTED_SPACE"] = False
+namespace["HOSTED_RUNTIME"] = False
 print(json.dumps({"ok": True, "calls": 2, "pipeline_version": "identity-anchored-v5-expressive-text-safe"}))
 `;
 
