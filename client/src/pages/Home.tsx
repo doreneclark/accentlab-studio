@@ -686,7 +686,6 @@ export default function Home() {
 
   useEffect(() => {
     if (
-      provider !== "huggingface" ||
       !hfAuthorized ||
       (hfStage !== "starting" &&
         hfStage !== "ready" &&
@@ -982,7 +981,7 @@ export default function Home() {
   };
 
   const handlePauseHuggingFace = async () => {
-    if (!hfAuthorized || !hfCsrfToken || hfGenerationActive || busy) return;
+    if (!hfAuthorized || !hfCsrfToken || hfGenerationActive) return;
     const confirmed = window.confirm(
       "Pause the Hugging Face worker? This stops only the Hugging Face Space; it does not pause Colab or the website. The Space can be deliberately started again later."
     );
@@ -1249,6 +1248,53 @@ export default function Home() {
             </button>
           </div>
         </div>
+
+        {hfAuthorized && hfRuntimeRunning && (
+          <aside
+            className="hf-billing-guard"
+            role="region"
+            aria-label="Paid Hugging Face worker controls"
+          >
+            <div
+              className="hf-billing-guard-copy"
+              role="status"
+              aria-live="polite"
+            >
+              <strong>
+                {hfStage === "pausing"
+                  ? "Hugging Face pause requested"
+                  : hfStage === "starting"
+                    ? "Hugging Face T4-small is starting"
+                    : "Hugging Face T4-small is running"}
+              </strong>
+              <p>
+                Billed ${hfPrice.toFixed(2)} per hour, by the minute, while
+                starting or running. Charges may continue until Hugging Face
+                confirms the Space is paused.
+              </p>
+              {hfGenerationActive && (
+                <p className="hf-billing-guard-warning">
+                  A generation is still active. Pause becomes available when it
+                  finishes.
+                </p>
+              )}
+            </div>
+            <button
+              className="hf-pause-guard-button"
+              type="button"
+              disabled={hfGenerationActive || hfStage === "pausing"}
+              onClick={() => void handlePauseHuggingFace()}
+            >
+              {hfStage === "pausing" ? (
+                <>
+                  <LoaderCircle className="spin" size={15} /> Pause pending
+                </>
+              ) : (
+                "Pause Hugging Face Space"
+              )}
+            </button>
+          </aside>
+        )}
 
         {provider === "colab" && (
           <>
@@ -1616,21 +1662,6 @@ export default function Home() {
                     Connect to ready worker
                   </button>
                 )}
-                {hfRuntimeRunning && (
-                  <button
-                    className="managed-cta managed-repair-button"
-                    type="button"
-                    disabled={
-                      busy || hfGenerationActive || hfStage === "pausing"
-                    }
-                    onClick={() => void handlePauseHuggingFace()}
-                  >
-                    {hfStage === "pausing" ? (
-                      <LoaderCircle className="spin" size={15} />
-                    ) : null}
-                    Pause Hugging Face worker
-                  </button>
-                )}
                 {hfGenerationActive && (
                   <p className="managed-notice is-error" role="status">
                     A generation may still be active. Pause is blocked while its
@@ -1668,8 +1699,10 @@ export default function Home() {
             )}
             <p className="session-note">
               Starting requires a separate confirmation displaying the T4-small
-              price. Pause stops only the Hugging Face worker—not Colab or this
-              website. Inputs are uploaded only when you generate and the Space
+              price. The pause control stays visible above the provider panels
+              while the paid Space is running, even after switching providers.
+              Pause stops only the Hugging Face worker—not Colab or this website.
+              Inputs are uploaded only when you generate and the Space
               deletes those uploads after the attempt; no Google Drive access is
               used. If you stop listening, the worker may continue the current
               take, so pause remains blocked for the safety lease.

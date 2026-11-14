@@ -1031,6 +1031,69 @@ h1 em {
   flex-wrap: wrap;
   gap: 14px;
 }
+.hf-billing-guard {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid #d7ad57;
+  border-left: 4px solid #b87925;
+  border-radius: 8px;
+  background: #fff7e6;
+  color: #382d1a;
+}
+.hf-billing-guard-copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.hf-billing-guard-copy strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.hf-billing-guard-copy p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.hf-billing-guard-copy .hf-billing-guard-warning {
+  color: #922f23;
+  font-weight: 600;
+}
+.hf-pause-guard-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  gap: 7px;
+  min-height: 40px;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 5px;
+  background: #8c3328;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.hf-pause-guard-button:hover {
+  background: #71251e;
+}
+.hf-pause-guard-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+@media (max-width: 650px) {
+  .hf-billing-guard {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .hf-pause-guard-button {
+    width: 100%;
+  }
+}
 .managed-cta {
   display: inline-flex;
   align-items: center;
