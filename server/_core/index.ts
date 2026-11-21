@@ -3,8 +3,6 @@ import express from "express";
 import { createServer } from "http";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerColabApiRoutes } from "../colab-api";
-import { registerHuggingFaceApiRoutes } from "../huggingface-api";
-import { registerModalApiRoutes } from "../modal-api";
 import { registerOAuthRoutes } from "./oauth";
 import { publicPlatformScript } from "./publicConfig";
 import { appRouter } from "../routers";
@@ -16,16 +14,9 @@ async function startServer() {
   const server = createServer(app);
   // Colab control requests contain only launch/progress tokens, never audio files.
   app.use("/api/colab", express.json({ limit: "16kb" }));
-  app.use("/api/huggingface", express.json({ limit: "16kb" }));
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   registerColabApiRoutes(app, {
-    allowPreviewProxyOrigin: process.env.NODE_ENV === "development",
-  });
-  registerHuggingFaceApiRoutes(app, {
-    allowPreviewProxyOrigin: process.env.NODE_ENV === "development",
-  });
-  registerModalApiRoutes(app, {
     allowPreviewProxyOrigin: process.env.NODE_ENV === "development",
   });
   app.use(express.urlencoded({ limit: "50mb", extended: true }));

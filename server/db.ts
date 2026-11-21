@@ -1,27 +1,7 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import {
-  InsertUser,
-  huggingFaceGenerationLeases,
-  users,
-} from "../drizzle/schema";
+import { InsertUser, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
-
-export interface HuggingFaceLeaseRecord {
-  state: "idle" | "active" | "pausing";
-  generationId: string;
-  expiresAt: number;
-}
-
-export interface HuggingFaceLeaseAccess {
-  get(): HuggingFaceLeaseRecord;
-  save(record: HuggingFaceLeaseRecord): Promise<void>;
-}
-
-export type HuggingFaceLeaseLock = <T>(
-  ownerEmail: string,
-  operation: (lease: HuggingFaceLeaseAccess) => Promise<T>
-) => Promise<T>;
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -37,52 +17,6 @@ export async function getDb() {
   }
   return _db;
 }
-
-export const withHuggingFaceLeaseLock: HuggingFaceLeaseLock = async (
-  ownerEmail,
-  operation
-) => {
-  const db = await getDb();
-  if (!db) throw new Error("Shared database is unavailable.");
-  return db.transaction(async tx => {
-    await tx
-      .insert(huggingFaceGenerationLeases)
-      .values({
-        ownerEmail,
-        state: "idle",
-        generationId: "",
-        expiresAt: new Date(0),
-      })
-      .onDuplicateKeyUpdate({ set: { ownerEmail } });
-    const rows = await tx
-      .select()
-      .from(huggingFaceGenerationLeases)
-      .where(eq(huggingFaceGenerationLeases.ownerEmail, ownerEmail))
-      .for("update")
-      .limit(1);
-    const row = rows[0];
-    if (!row) throw new Error("HF generation lease row is unavailable.");
-    let current: HuggingFaceLeaseRecord = {
-      state: row.state,
-      generationId: row.generationId,
-      expiresAt: row.expiresAt.getTime(),
-    };
-    return operation({
-      get: () => ({ ...current }),
-      save: async record => {
-        await tx
-          .update(huggingFaceGenerationLeases)
-          .set({
-            state: record.state,
-            generationId: record.generationId,
-            expiresAt: new Date(record.expiresAt),
-          })
-          .where(eq(huggingFaceGenerationLeases.ownerEmail, ownerEmail));
-        current = { ...record };
-      },
-    });
-  });
-};
 
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) {

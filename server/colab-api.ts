@@ -17,7 +17,6 @@ import {
   buildBootstrapStartCode,
   buildBootstrapStatusCode,
 } from "./colab-bootstrap";
-import { HUGGINGFACE_STATE_COOKIE } from "./huggingface-api";
 
 export const COLAB_PUBLIC_ORIGIN = "https://accentlab2-ii4q5q9z.manus.space";
 export const COLAB_CALLBACK_PATH = "/api/colab/oauth/callback";
@@ -1069,13 +1068,6 @@ export function registerColabApiRoutes(
   app.get(
     COLAB_CALLBACK_PATH,
     async (req: Request, res: ExpressResponse, next: NextFunction) => {
-      if (
-        readCookie(req, HUGGINGFACE_STATE_COOKIE) ||
-        readCookie(req, "accentlab_modal_oauth_state")
-      ) {
-        next();
-        return;
-      }
       res.set("Cache-Control", "no-store");
       const stateCookie = readCookie(req, COLAB_STATE_COOKIE);
       clearCookie(res, COLAB_STATE_COOKIE, allowInsecureCookies);

@@ -60,30 +60,6 @@ export function normalizeEndpoint(raw: string): string {
   return url.origin;
 }
 
-export function normalizeHuggingFaceEndpoint(raw: string): string {
-  let url: URL;
-  try {
-    url = new URL(raw.trim());
-  } catch {
-    throw new Error("Hugging Face returned an invalid Space endpoint.");
-  }
-  if (
-    url.protocol !== "https:" ||
-    !/^[a-z0-9-]+\.hf\.space$/i.test(url.hostname) ||
-    url.username ||
-    url.password ||
-    url.port ||
-    url.search ||
-    url.hash ||
-    (url.pathname !== "/" && url.pathname !== "")
-  ) {
-    throw new Error(
-      "Use the verified HTTPS endpoint for the configured Hugging Face Space."
-    );
-  }
-  return url.origin;
-}
-
 export function validateAudio(file: Pick<File, "name" | "size">): void {
   if (!/\.(wav|mp3|m4a|ogg|webm|aac|flac)$/i.test(file.name)) {
     throw new Error(
@@ -99,17 +75,13 @@ export function validateAudio(file: Pick<File, "name" | "size">): void {
   }
 }
 
-export function safeError(
-  error: unknown,
-  accessKey = "",
-  provider = "Colab"
-): string {
+export function safeError(error: unknown, accessKey = ""): string {
   const raw =
     error instanceof Error
       ? error.message
       : typeof error === "string"
         ? error
-        : `The ${provider} request failed.`;
+        : "The Colab request failed.";
   const redacted = accessKey
     ? raw.split(accessKey).join("[session code]")
     : raw;
@@ -118,28 +90,16 @@ export function safeError(
       redacted
     )
   ) {
-    return provider === "Hugging Face"
-      ? "The Hugging Face Space is unreachable or has paused. Check its state and start it deliberately before reconnecting."
-      : provider === "Modal"
-        ? "The Modal serverless worker is unreachable or still starting. Check the worker deployment and wait for the current request before trying again."
-        : "The Colab session is unreachable or has expired. Keep Colab running, then reconnect using its current URL and session code.";
+    return "The Colab session is unreachable or has expired. Keep Colab running, then reconnect using its current URL and session code.";
   }
   return redacted.slice(0, 350);
 }
 
-export function safeGenerationError(
-  error: unknown,
-  accessKey = "",
-  provider = "Colab"
-): string {
-  return `${safeError(error, accessKey, provider)} Partial takes are not saved; a new attempt starts from the beginning.`;
+export function safeGenerationError(error: unknown, accessKey = ""): string {
+  return `${safeError(error, accessKey)} Partial takes are not saved; a new attempt starts from the beginning.`;
 }
 
-export function resultAudioUrl(
-  value: unknown,
-  endpoint: string,
-  provider = "Colab"
-): string {
+export function resultAudioUrl(value: unknown, endpoint: string): string {
   if (
     !value ||
     typeof value !== "object" ||
@@ -147,9 +107,7 @@ export function resultAudioUrl(
     typeof value.url !== "string"
   ) {
     throw new Error(
-      provider === "Hugging Face"
-        ? "The model did not return an audio file. Check the Hugging Face Space logs for an error."
-        : "The model did not return an audio file. Check the last Colab cell for an error."
+      "The model did not return an audio file. Check the last Colab cell for an error."
     );
   }
   const url = new URL(value.url, endpoint);
@@ -184,10 +142,7 @@ async function withTimeout<T>(
   }
 }
 
-function requireIdentityPipeline(
-  value: unknown,
-  provider = "Colab"
-): asserts value is ColabStatus {
+function requireIdentityPipeline(value: unknown): asserts value is ColabStatus {
   if (
     !value ||
     typeof value !== "object" ||
@@ -195,9 +150,7 @@ function requireIdentityPipeline(
     value.pipeline_version !== REQUIRED_PIPELINE_VERSION
   ) {
     throw new Error(
-      provider === "Hugging Face"
-        ? "This Hugging Face Space uses an older conversion pipeline. Deploy the synchronized v5 Space template before connecting. No audio was uploaded."
-        : "This Colab worker uses an older conversion pipeline. For manual connection, run the updated v5 notebook; for managed connection, start or reuse the current v5 backend. Then reconnect. No audio was uploaded."
+      "This Colab worker uses an older conversion pipeline. For manual connection, run the updated v5 notebook; for managed connection, start or reuse the current v5 backend. Then reconnect. No audio was uploaded."
     );
   }
   if (
@@ -207,7 +160,7 @@ function requireIdentityPipeline(
     value.gpu !== true
   ) {
     throw new Error(
-      `The identity-anchored model is not ready. Check ${provider} and reconnect before generating.`
+      "The identity-anchored model is not ready. Check Colab and reconnect before generating."
     );
   }
 }
@@ -219,28 +172,19 @@ export class ColabConnection {
     private readonly handleFile: typeof import("@gradio/client").handle_file,
     readonly endpoint: string,
     private readonly accessKey: string,
-    readonly status: ColabStatus,
-    private readonly provider = "Colab"
+    readonly status: ColabStatus
   ) {}
 
   static async connect(
     rawEndpoint: string,
-    rawKey: string,
-    provider: "Colab" | "Hugging Face" = "Colab"
+    rawKey: string
   ): Promise<ColabConnection> {
-    const endpoint =
-      provider === "Hugging Face"
-        ? normalizeHuggingFaceEndpoint(rawEndpoint)
-        : normalizeEndpoint(rawEndpoint);
+    const endpoint = normalizeEndpoint(rawEndpoint);
     const accessKey = rawKey.trim();
     if (!accessKey)
       throw new Error(
-        provider === "Hugging Face"
-          ? "The Hugging Face Space access key is missing. Refresh the authorized session before connecting."
-          : "Paste the session access code printed by the final Colab cell."
+        "Paste the session access code printed by the final Colab cell."
       );
-    const providerName =
-      provider === "Hugging Face" ? "Hugging Face Space" : "Colab";
     const { Client, handle_file: handleFile } = await import("@gradio/client");
     let client: GradioClient | undefined;
     let abandoned = false;
@@ -258,27 +202,25 @@ export class ColabConnection {
       client = await withTimeout(
         pending,
         CONNECT_TIMEOUT_MS,
-        `${providerName} did not respond in time. Check that its backend is still running.`
+        `Colab did not respond in time. Check that its backend is still running.`
       );
       const api = await withTimeout(
         client.view_api(),
         CONNECT_TIMEOUT_MS,
-        `Could not read the ${providerName} API. Check the backend and reconnect.`
+        `Could not read the Colab API. Check the backend and reconnect.`
       );
       if (
         !api.named_endpoints?.["/status"] ||
         !api.named_endpoints?.["/generate"]
       ) {
         throw new Error(
-          provider === "Hugging Face"
-            ? "This is an older or different Space. Deploy the synchronized v5 Space with /status and /generate endpoints."
-            : "This is an older or different notebook. Run the updated AccentLab notebook with /status and /generate endpoints."
+          "This is an older or different notebook. Run the updated AccentLab notebook with /status and /generate endpoints."
         );
       }
       const response = await withTimeout(
         client.predict("/status", [accessKey]),
         CONNECT_TIMEOUT_MS,
-        `The GPU readiness check timed out. Check ${providerName} and reconnect.`
+        `The GPU readiness check timed out. Check Colab and reconnect.`
       );
       const value = Array.isArray(response.data) ? response.data[0] : undefined;
       if (
@@ -288,40 +230,33 @@ export class ColabConnection {
         !("gpu" in value)
       ) {
         throw new Error(
-          provider === "Hugging Face"
-            ? "Hugging Face returned an incompatible status response. Deploy the synchronized v5 Space."
-            : "Colab returned an incompatible status response. Run the updated notebook."
+          "Colab returned an incompatible status response. Run the updated notebook."
         );
       }
       const status = value as ColabStatus;
       if (status.ready !== true || status.gpu !== true) {
         throw new Error(
           status.message ||
-            (provider === "Hugging Face"
-              ? "A T4-small GPU is not ready. Wait for the Space to finish starting, then reconnect."
-              : "A GPU is not ready. Select T4 GPU in Colab and run all cells.")
+            "A GPU is not ready. Select T4 GPU in Colab and run all cells."
         );
       }
       if (!Number.isFinite(status.sample_rate) || status.sample_rate < 8000) {
         throw new Error(
-          provider === "Hugging Face"
-            ? "The Space returned an invalid sample rate. Deploy the synchronized v5 Space."
-            : "The notebook returned an invalid sample rate. Run the updated notebook."
+          "The notebook returned an invalid sample rate. Run the updated notebook."
         );
       }
-      requireIdentityPipeline(status, provider);
+      requireIdentityPipeline(status);
       return new ColabConnection(
         client,
         handleFile,
         endpoint,
         accessKey,
-        status,
-        provider
+        status
       );
     } catch (error) {
       abandoned = true;
       client?.close();
-      throw new Error(safeError(error, accessKey, provider));
+      throw new Error(safeError(error, accessKey));
     }
   }
 
@@ -337,9 +272,7 @@ export class ColabConnection {
     signal?: AbortSignal
   ): Promise<Blob> {
     if (this.closed)
-      throw new Error(
-        `The ${this.provider} connection has been closed. Reconnect first.`
-      );
+      throw new Error("The Colab connection has been closed. Reconnect first.");
     validateAudio(input.sourceVoice);
     validateAudio(input.accentReference);
     const script = input.script.trim();
@@ -372,7 +305,7 @@ export class ColabConnection {
       validateAudio(input.sobSample);
     if (signal?.aborted)
       throw new Error(
-        `Stopped listening. A job already running on ${this.provider} may still finish.`
+        "Stopped listening. A job already running on Colab may still finish."
       );
 
     // Do not let a runtime that was replaced after connection silently use the
@@ -384,14 +317,13 @@ export class ColabConnection {
       const response = await withTimeout(
         this.client.predict("/status", [this.accessKey]),
         CONNECT_TIMEOUT_MS,
-        `The model readiness check timed out. Check ${this.provider} and reconnect.`
+        "The model readiness check timed out. Check Colab and reconnect."
       );
       requireIdentityPipeline(
-        Array.isArray(response.data) ? response.data[0] : undefined,
-        this.provider
+        Array.isArray(response.data) ? response.data[0] : undefined
       );
     } catch (error) {
-      throw new Error(safeError(error, this.accessKey, this.provider));
+      throw new Error(safeError(error, this.accessKey));
     }
     if (this.closed || signal?.aborted) {
       throw new Error(
@@ -401,7 +333,7 @@ export class ColabConnection {
 
     const downloadController = new AbortController();
     onProgress({
-      message: `Uploading references to your ${this.provider} session…`,
+      message: "Uploading references to your Colab session…",
     });
     const job = this.client.submit("/generate", [
       this.handleFile(input.sourceVoice),
@@ -432,13 +364,13 @@ export class ColabConnection {
     };
     const onAbort = () =>
       stop(
-        `Stopped listening. A job already running on ${this.provider} may still finish.`
+        "Stopped listening. A job already running on Colab may still finish."
       );
     signal?.addEventListener("abort", onAbort, { once: true });
     timer = setTimeout(
       () =>
         stop(
-          `Conversion exceeded 15 minutes. The GPU may be busy. Check ${this.provider} before trying again.`
+          "Conversion exceeded 15 minutes. The GPU may be busy. Check Colab before trying again."
         ),
       GENERATE_TIMEOUT_MS
     );
@@ -455,9 +387,7 @@ export class ColabConnection {
                   : event.message?.map(item => item.message).join(" ");
               throw new Error(
                 message ||
-                  (this.provider === "Hugging Face"
-                    ? "The GPU conversion failed. Check the Hugging Face Space logs."
-                    : "The GPU conversion failed. Check the notebook output.")
+                  "The GPU conversion failed. Check the notebook output."
               );
             }
             const progress = event.progress_data?.at(-1);
@@ -469,20 +399,18 @@ export class ColabConnection {
               progress?.desc ||
               (event.stage === "pending"
                 ? typeof event.position === "number"
-                  ? `Queued on ${this.provider} · position ${event.position + 1}`
-                  : this.provider === "Colab"
-                    ? "Waiting for the free GPU…"
-                    : "Waiting for the Hugging Face GPU…"
+                  ? `Queued on Colab · position ${event.position + 1}`
+                  : "Waiting for the free GPU…"
                 : "Converting the reference voice and accent…");
             onProgress({
-              message: safeError(message, this.accessKey, this.provider),
+              message: safeError(message, this.accessKey),
               fraction,
             });
           }
           if (event.type === "data" && Array.isArray(event.data))
             audio = event.data[0];
         }
-        const audioUrl = resultAudioUrl(audio, this.endpoint, this.provider);
+        const audioUrl = resultAudioUrl(audio, this.endpoint);
         onProgress({ message: "Downloading the converted WAV…", fraction: 1 });
         const response = await withTimeout(
           fetch(audioUrl, {
@@ -491,25 +419,23 @@ export class ColabConnection {
             cache: "no-store",
           }),
           45_000,
-          `The audio download timed out. Check ${this.provider}.`
+          "The audio download timed out. Check Colab."
         );
         if (!response.ok)
           throw new Error(
-            `The output download failed. The ${this.provider} session may have expired.`
+            "The output download failed. The Colab session may have expired."
           );
         const blob = await withTimeout(
           response.blob(),
           45_000,
-          `The audio download timed out. Check ${this.provider}.`
+          "The audio download timed out. Check Colab."
         );
         if (
           !blob.size ||
           blob.size > 100 * 1024 * 1024 ||
           /text\/|application\/(json|xhtml)/i.test(blob.type)
         ) {
-          throw new Error(
-            `${this.provider} returned an empty or invalid audio download.`
-          );
+          throw new Error("Colab returned an empty or invalid audio download.");
         }
         const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
         const signature = String.fromCharCode(...header);
@@ -517,9 +443,7 @@ export class ColabConnection {
           signature.slice(0, 4) !== "RIFF" ||
           signature.slice(8, 12) !== "WAVE"
         ) {
-          throw new Error(
-            `${this.provider} did not return a valid WAV recording.`
-          );
+          throw new Error("Colab did not return a valid WAV recording.");
         }
         return new Blob([blob], { type: "audio/wav" });
       };
@@ -531,7 +455,7 @@ export class ColabConnection {
         /* No remaining active job. */
       }
       downloadController.abort();
-      throw new Error(safeError(error, this.accessKey, this.provider));
+      throw new Error(safeError(error, this.accessKey));
     } finally {
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);

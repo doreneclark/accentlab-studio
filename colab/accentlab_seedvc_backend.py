@@ -1,21 +1,16 @@
-"""AccentLab experimental two-reference Seed-VC v5 expressive backend.
+"""AccentLab experimental two-reference Seed-VC v5 expressive Google Colab backend.
 
 This module runs from a pinned checkout of the official Seed-VC repository in
-Google Colab, an optional Hugging Face Space, or the optional Modal T4 worker.
-It is an experimental approximation, not a model-
-level disentangler of speaker identity and accent, and does not promise an
-identity, naturalness, or accent improvement.
+Google Colab. It is an experimental approximation, not a model-level
+disentangler of speaker identity and accent, and does not promise an identity,
+naturalness, or accent improvement.
 
 The public Gradio API is intentionally small and stable:
 
-* ``/status``: ``access_key: str`` -> JSON with ``ready``, ``gpu``,
-  ``sample_rate``, ``pipeline_version`` and ``message`` for authorized callers.
-* ``/generate``: source/accent references, tagged script, access code, consent,
-  and optional original-speaker laugh/giggle and sob samples -> an audio filepath.
-
-Colab creates a random access key at process launch; the hosted Space reads its
-separate protected application key from an environment secret. Neither key is
-stored in this source file. The caller must supply it for both API endpoints.
+* ``/status``: no inputs -> JSON with ``ready``, ``gpu``, ``sample_rate``,
+  ``pipeline_version`` and ``message``.
+* ``/generate``: source/accent references, tagged script, consent, and optional
+  original-speaker laugh/giggle and sob samples -> an audio filepath.
 """
 
 from __future__ import annotations
@@ -74,36 +69,11 @@ MOOD_PROSODY = {
     "sad": {"rate": "-7%", "pitch": "-2Hz"},
     "calm": {"rate": "-4%", "pitch": "-1Hz"},
 }
-HOSTED_SPACE = os.environ.get("ACCENTLAB_HF_SPACE") == "1"
-MODAL_RUNTIME = os.environ.get("ACCENTLAB_MODAL_RUNTIME") == "1"
-HOSTED_RUNTIME = HOSTED_SPACE or MODAL_RUNTIME
-DISABLE_AUTOSTART = os.environ.get("ACCENTLAB_DISABLE_AUTOSTART") == "1"
-OUTPUT_RETENTION_SECONDS = 5 * 60 if HOSTED_RUNTIME else 60 * 60
-OUTPUT_DIR = Path(
-    os.environ.get(
-        "ACCENTLAB_OUTPUT_DIR",
-        str(Path(tempfile.gettempdir()) / "accentlab_outputs"),
-    )
-)
+OUTPUT_DIR = Path(tempfile.gettempdir()) / "accentlab_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# The HF Space uses a separate, protected application key shared with the
-# AccentLab server. It is never sent to Hugging Face management APIs or logged.
-# Colab keeps its existing one-time random key behavior and printed handoff.
-ACCESS_KEY = (
-    os.environ.get("ACCENTLAB_ACCESS_KEY", "").strip()
-    if HOSTED_SPACE
-    else secrets.token_urlsafe(18)
-)
-if HOSTED_SPACE and len(ACCESS_KEY) < 32:
-    raise RuntimeError(
-        "ACCENTLAB_ACCESS_KEY must be configured as a protected Space secret of at least 32 characters."
-    )
+ACCESS_KEY = secrets.token_urlsafe(18)
 ACCESS_KEY_DIGEST = hashlib.sha256(ACCESS_KEY.encode("utf-8")).digest()
-if HOSTED_RUNTIME:
-    print("AccentLab hosted access key is configured; value withheld.")
-else:
-    print(f"AccentLab access code (keep private): {ACCESS_KEY}")
+print(f"AccentLab access code (keep private): {ACCESS_KEY}")
 print(f"Seed-VC source pin: {SEED_VC_COMMIT}")
 print(f"AccentLab pipeline: {PIPELINE_VERSION}")
 
@@ -112,13 +82,6 @@ MODEL_ERROR: str | None = None
 GPU_AVAILABLE = bool(torch.cuda.is_available())
 GENERATION_LOCK = threading.Lock()
 
-
-def _key_is_valid(access_key: Any) -> bool:
-    """Compare a submitted key without exposing the stored key."""
-    if not isinstance(access_key, str) or not access_key:
-        return False
-    candidate_digest = hashlib.sha256(access_key.encode("utf-8")).digest()
-    return hmac.compare_digest(candidate_digest, ACCESS_KEY_DIGEST)
 
 
 def _seed_vc_import_path() -> None:
@@ -152,11 +115,7 @@ def _load_v2_model() -> Any:
         return MODEL
     if not GPU_AVAILABLE:
         raise RuntimeError(
-            "A CUDA GPU is required; configure a Hugging Face T4-small runtime."
-            if HOSTED_SPACE
-            else "A CUDA GPU is required; configure the Modal T4 worker."
-            if MODAL_RUNTIME
-            else "A CUDA GPU is required; select a free Colab T4 runtime."
+            "A CUDA GPU is required; select a free Colab T4 runtime."
         )
 
     _seed_vc_import_path()
@@ -185,11 +144,7 @@ def initialize_runtime() -> None:
     global MODEL_ERROR
     if not GPU_AVAILABLE:
         MODEL_ERROR = (
-            "CUDA GPU unavailable; configure a Hugging Face T4-small runtime."
-            if HOSTED_SPACE
-            else "CUDA GPU unavailable; configure the Modal T4 worker."
-            if MODAL_RUNTIME
-            else "CUDA GPU unavailable; choose Runtime > Change runtime type > T4 GPU."
+            "CUDA GPU unavailable; choose Runtime > Change runtime type > T4 GPU."
         )
         print(f"AccentLab not ready: {MODEL_ERROR}")
         return
@@ -202,8 +157,16 @@ def initialize_runtime() -> None:
         print(f"AccentLab not ready: {MODEL_ERROR}")
 
 
+def _key_is_valid(access_key: Any) -> bool:
+    """Compare the submitted Colab session code without exposing the stored code."""
+    if not isinstance(access_key, str) or not access_key:
+        return False
+    candidate_digest = hashlib.sha256(access_key.encode("utf-8")).digest()
+    return hmac.compare_digest(candidate_digest, ACCESS_KEY_DIGEST)
+
+
 def _status(access_key: str) -> dict[str, Any]:
-    """Return the health contract, without revealing unauthorized state."""
+    """Return the backend health contract only to a caller with the session code."""
     if not _key_is_valid(access_key):
         return {
             "ready": False,
@@ -217,13 +180,7 @@ def _status(access_key: str) -> dict[str, Any]:
             "gpu": False,
             "sample_rate": SAMPLE_RATE,
             "pipeline_version": PIPELINE_VERSION,
-            "message": (
-                "CUDA GPU unavailable; configure a Hugging Face T4-small runtime."
-                if HOSTED_SPACE
-                else "CUDA GPU unavailable; configure the Modal T4 worker."
-                if MODAL_RUNTIME
-                else "CUDA GPU unavailable; select a free Colab T4 runtime."
-            ),
+            "message": "CUDA GPU unavailable; select a free Colab T4 runtime.",
         }
     if MODEL is None:
         return {
@@ -612,29 +569,8 @@ def _convert_once(
     return _collect_final_audio(outputs)
 
 
-def _cleanup_old_outputs() -> None:
-    """Bounded retention cleanup; never recursively removes Gradio directories."""
-    cutoff = time.time() - OUTPUT_RETENTION_SECONDS
-    for candidate in list(OUTPUT_DIR.glob("accentlab_*.wav"))[:256]:
-        try:
-            if candidate.stat().st_mtime < cutoff:
-                candidate.unlink()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
 
-
-def _cleanup_hosted_outputs() -> None:
-    """Remove expired hosted outputs even when no later generation arrives."""
-    if not HOSTED_RUNTIME:
-        return
-    while True:
-        _cleanup_old_outputs()
-        time.sleep(60)
-
-
-def _generate_impl(
+def _generate(
     source_voice: str,
     accent_reference: str,
     script: str,
@@ -645,7 +581,6 @@ def _generate_impl(
     progress=gr.Progress(),
 ) -> str:
     """Generate verified speech and insert explicitly requested speaker samples."""
-    # Authenticate before touching the model or starting any GPU conversion.
     if not _key_is_valid(access_key):
         raise gr.Error("Invalid access code.")
     if not GPU_AVAILABLE:
@@ -703,7 +638,6 @@ def _generate_impl(
         raise gr.Error("Another conversion is running; try again after it finishes.")
 
     try:
-        _cleanup_old_outputs()
         with tempfile.TemporaryDirectory(prefix="accentlab_") as work_dir:
             work = Path(work_dir)
             prepared_source = work / "source_reference.wav"
@@ -856,58 +790,10 @@ def _generate_impl(
         GENERATION_LOCK.release()
 
 
-def _remove_hosted_uploads(paths: Iterable[str | None]) -> None:
-    """Delete Gradio input uploads from the ephemeral Space temp folder."""
-    if not HOSTED_RUNTIME:
-        return
-    upload_root = Path(
-        os.environ.get("GRADIO_TEMP_DIR", str(Path(tempfile.gettempdir()) / "gradio"))
-    ).resolve()
-    for raw_path in paths:
-        if not raw_path or not isinstance(raw_path, str):
-            continue
-        try:
-            candidate = Path(raw_path).resolve(strict=True)
-            if candidate.is_file() and candidate.is_relative_to(upload_root):
-                candidate.unlink()
-        except (FileNotFoundError, OSError, RuntimeError):
-            continue
-
-
-def _generate(
-    source_voice: str,
-    accent_reference: str,
-    script: str,
-    access_key: str,
-    consent: bool,
-    laugh_sample: str | None = None,
-    sob_sample: str | None = None,
-    progress=gr.Progress(),
-) -> str:
-    """Scrub hosted input uploads after the unchanged v5 pipeline returns."""
-    try:
-        return _generate_impl(
-            source_voice,
-            accent_reference,
-            script,
-            access_key,
-            consent,
-            laugh_sample,
-            sob_sample,
-            progress,
-        )
-    finally:
-        _remove_hosted_uploads(
-            [source_voice, accent_reference, laugh_sample, sob_sample]
-        )
-
 
 def build_demo() -> gr.Blocks:
     """Build Blocks with the exact v4 /status and /generate API contracts."""
-    block_options = {"delete_cache": (60, OUTPUT_RETENTION_SECONDS)} if HOSTED_RUNTIME else {}
-    with gr.Blocks(
-        title="AccentLab Studio — expressive text-safe", **block_options
-    ) as demo:
+    with gr.Blocks(title="AccentLab Studio — expressive text-safe") as demo:
         gr.Markdown(
             "## AccentLab Studio — expressive text-safe conversion\n"
             "Use only recordings you have permission to transform. Mood cues use "
@@ -916,9 +802,11 @@ def build_demo() -> gr.Blocks:
             "original-speaker cry/sob sample. Supplied clips are inserted, not "
             "newly synthesized. Identity, naturalness and accent transfer are experimental."
         )
-        access_key = gr.Textbox(label="Access code", type="password")
         status_button = gr.Button("Check backend", visible=True)
         status_output = gr.JSON(label="Backend status")
+        access_key = gr.Textbox(
+            type="password", label="Colab session access code", visible=False
+        )
         status_button.click(
             _status,
             inputs=[access_key],
@@ -970,25 +858,8 @@ def build_demo() -> gr.Blocks:
     return demo
 
 
-if MODAL_RUNTIME and not DISABLE_AUTOSTART:
-    raise RuntimeError(
-        "Modal imports must set ACCENTLAB_DISABLE_AUTOSTART=1; the ASGI app owns startup."
-    )
-
-if not DISABLE_AUTOSTART:
-    initialize_runtime()
-    demo = build_demo()
-    demo.queue(default_concurrency_limit=1)
-    if HOSTED_SPACE:
-        threading.Thread(target=_cleanup_hosted_outputs, daemon=True).start()
-        print("Starting the Hugging Face Space Gradio app; access key withheld.")
-        demo.launch(
-            server_name="0.0.0.0",
-            server_port=int(os.environ.get("SPACE_PORT", "7860")),
-            share=False,
-            debug=False,
-            max_file_size="20mb",
-        )
-    else:
-        print("Starting temporary Gradio URL; keep this Colab tab open while using it.")
-        demo.launch(share=True, debug=True, max_file_size="20mb")
+initialize_runtime()
+demo = build_demo()
+demo.queue(default_concurrency_limit=1)
+print("Starting temporary Gradio URL; keep this Colab tab open while using it.")
+demo.launch(share=True, debug=True, max_file_size="20mb")
